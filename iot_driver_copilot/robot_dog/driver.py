@@ -1,221 +1,245 @@
 import os
 import asyncio
+import logging
 import yaml
 import json
-from typing import Optional, Dict, Any
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-from kubernetes import config as k8s_config
-from kubernetes import client as k8s_client
-import paho.mqtt.client as mqtt
-import uvicorn
+import signal
+from typing import Dict, Any
 
-# Environment Variables (Required)
-EDGEDEVICE_NAME = os.environ["EDGEDEVICE_NAME"]
-EDGEDEVICE_NAMESPACE = os.environ["EDGEDEVICE_NAMESPACE"]
-HTTP_SERVER_HOST = os.environ.get("HTTP_SERVER_HOST", "0.0.0.0")
-HTTP_SERVER_PORT = int(os.environ.get("HTTP_SERVER_PORT", "8080"))
-MQTT_BROKER_HOST = os.environ["MQTT_BROKER_HOST"]
-MQTT_BROKER_PORT = int(os.environ.get("MQTT_BROKER_PORT", "1883"))
-MQTT_USERNAME = os.environ.get("MQTT_USERNAME", "")
-MQTT_PASSWORD = os.environ.get("MQTT_PASSWORD", "")
-MQTT_STATUS_TOPIC = os.environ.get("MQTT_STATUS_TOPIC", "robotdog/status")
-MQTT_COMMAND_TOPIC = os.environ.get("MQTT_COMMAND_TOPIC", "robotdog/command")
-INSTRUCTION_CONFIG_PATH = "/etc/edgedevice/config/instructions"
+import aiohttp
+from aiohttp import web
+from kubernetes import config, client
+from kubernetes.client.rest import ApiException
+from kubernetes.config import ConfigException
 
-# DeviceShifu CRD API
-CRD_GROUP = "shifu.edgenesis.io"
-CRD_VERSION = "v1alpha1"
-CRD_PLURAL = "edgedevices"
+from asyncio_mqtt import Client as MQTTClient, MqttError
 
-# Device phase enums
+# Logging setup
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("DeviceShifu-RobotDog")
+
+# Constants for EdgeDevice status phases
 PHASE_PENDING = "Pending"
 PHASE_RUNNING = "Running"
 PHASE_FAILED = "Failed"
 PHASE_UNKNOWN = "Unknown"
 
-class CommandReq(BaseModel):
-    command: str
+# MQTT message structure
+ALLOWED_COMMANDS = {'forward', 'backward', 'start', 'stop'}
 
-# Settings loader
-def load_instruction_config(path: str) -> Dict[str, Any]:
+# Read environment variables
+EDGEDEVICE_NAME = os.environ.get("EDGEDEVICE_NAME")
+EDGEDEVICE_NAMESPACE = os.environ.get("EDGEDEVICE_NAMESPACE")
+MQTT_BROKER_HOST = os.environ.get("MQTT_BROKER_HOST")
+MQTT_BROKER_PORT = int(os.environ.get("MQTT_BROKER_PORT", "1883"))
+MQTT_USERNAME = os.environ.get("MQTT_USERNAME", "")
+MQTT_PASSWORD = os.environ.get("MQTT_PASSWORD", "")
+MQTT_TOPIC_COMMAND = os.environ.get("MQTT_TOPIC_COMMAND", "robotdog/command")
+MQTT_TOPIC_STATUS = os.environ.get("MQTT_TOPIC_STATUS", "robotdog/status")
+
+HTTP_SERVER_HOST = os.environ.get("HTTP_SERVER_HOST", "0.0.0.0")
+HTTP_SERVER_PORT = int(os.environ.get("HTTP_SERVER_PORT", "8080"))
+
+if not EDGEDEVICE_NAME or not EDGEDEVICE_NAMESPACE:
+    logger.error("EDGEDEVICE_NAME and EDGEDEVICE_NAMESPACE environment variables are required.")
+    exit(1)
+if not MQTT_BROKER_HOST:
+    logger.error("MQTT_BROKER_HOST environment variable is required.")
+    exit(1)
+
+CONFIG_MAP_INSTRUCTION_PATH = "/etc/edgedevice/config/instructions"
+
+# Kubernetes API Setup
+def get_k8s_api():
     try:
-        with open(path, "r") as f:
-            return yaml.safe_load(f)
-    except Exception:
-        return {}
+        config.load_incluster_config()
+    except ConfigException:
+        logger.error("Not running in-cluster. Exiting.")
+        exit(1)
+    return client.CustomObjectsApi()
 
-# Kubernetes CRD status updater
-class EdgeDeviceStatusUpdater:
-    def __init__(self, name: str, namespace: str):
-        try:
-            k8s_config.load_incluster_config()
-        except Exception:
-            # For testing outside k8s
-            k8s_config.load_kube_config()
-        self.api = k8s_client.CustomObjectsApi()
-        self.name = name
-        self.namespace = namespace
-
-    def get_edgedevice(self):
-        return self.api.get_namespaced_custom_object(
-            group=CRD_GROUP,
-            version=CRD_VERSION,
-            namespace=self.namespace,
-            plural=CRD_PLURAL,
-            name=self.name
-        )
-
-    def patch_phase(self, phase: str):
-        body = {"status": {"edgeDevicePhase": phase}}
-        self.api.patch_namespaced_custom_object_status(
-            group=CRD_GROUP,
-            version=CRD_VERSION,
-            namespace=self.namespace,
-            plural=CRD_PLURAL,
-            name=self.name,
+# EdgeDevice CRD interaction
+async def update_edgedevice_phase(api, phase: str):
+    body = {"status": {"edgeDevicePhase": phase}}
+    group = "shifu.edgenesis.io"
+    version = "v1alpha1"
+    plural = "edgedevices"
+    try:
+        api.patch_namespaced_custom_object_status(
+            group=group,
+            version=version,
+            namespace=EDGEDEVICE_NAMESPACE,
+            plural=plural,
+            name=EDGEDEVICE_NAME,
             body=body
         )
+        logger.info(f"EdgeDevice status phase set to {phase}")
+    except ApiException as e:
+        logger.error(f"Failed to update EdgeDevice status: {e}")
 
-    def get_address(self) -> Optional[str]:
-        try:
-            obj = self.get_edgedevice()
-            return obj.get("spec", {}).get("address")
-        except Exception:
-            return None
-
-# MQTT Handler
-class RobotDogMQTTClient:
-    def __init__(self, broker_host, broker_port, status_topic, command_topic, username="", password=""):
-        self.broker_host = broker_host
-        self.broker_port = broker_port
-        self.status_topic = status_topic
-        self.command_topic = command_topic
-        self.username = username
-        self.password = password
-        self.status: Optional[Dict[str, Any]] = None
-        self.connected = False
-        self._loop = asyncio.get_event_loop()
-        self._client = mqtt.Client()
-        if self.username:
-            self._client.username_pw_set(self.username, self.password)
-        self._client.on_connect = self._on_connect
-        self._client.on_disconnect = self._on_disconnect
-        self._client.on_message = self._on_message
-
-    def _on_connect(self, client, userdata, flags, rc):
-        if rc == 0:
-            self.connected = True
-            client.subscribe(self.status_topic)
-        else:
-            self.connected = False
-
-    def _on_disconnect(self, client, userdata, rc):
-        self.connected = False
-
-    def _on_message(self, client, userdata, msg):
-        try:
-            payload = msg.payload.decode()
-            self.status = json.loads(payload)
-        except Exception:
-            self.status = None
-
-    def connect(self):
-        def loop():
-            try:
-                self._client.connect(self.broker_host, self.broker_port, 60)
-                self._client.loop_forever()
-            except Exception:
-                self.connected = False
-        loop_thread = asyncio.get_event_loop().run_in_executor(None, loop)
-        return loop_thread
-
-    def publish_command(self, command: str):
-        payload = json.dumps({"command": command})
-        self._client.publish(self.command_topic, payload)
-
-    def get_status(self):
-        return self.status
-
-# FASTAPI App
-app = FastAPI()
-instruction_config = load_instruction_config(INSTRUCTION_CONFIG_PATH)
-edgedevice_status_updater = EdgeDeviceStatusUpdater(EDGEDEVICE_NAME, EDGEDEVICE_NAMESPACE)
-robotdog_mqtt_client: Optional[RobotDogMQTTClient] = None
-
-# Supported commands
-SUPPORTED_COMMANDS = {"forward", "backward", "start", "stop"}
-
-async def update_device_phase_loop():
-    last_phase = None
-    while True:
-        # Detect actual phase
-        phase = PHASE_UNKNOWN
-        try:
-            address = edgedevice_status_updater.get_address()
-            if not address:
-                phase = PHASE_UNKNOWN
-            elif robotdog_mqtt_client is None:
-                phase = PHASE_PENDING
-            elif robotdog_mqtt_client.connected:
-                phase = PHASE_RUNNING
-            else:
-                phase = PHASE_FAILED
-        except Exception:
-            phase = PHASE_UNKNOWN
-
-        if phase != last_phase:
-            try:
-                edgedevice_status_updater.patch_phase(phase)
-            except Exception:
-                pass
-            last_phase = phase
-        await asyncio.sleep(2)
-
-@app.on_event("startup")
-async def startup_event():
-    global robotdog_mqtt_client
-    # Load MQTT settings from config if present
-    protocol_settings = instruction_config.get("robotdog", {}).get("protocolPropertyList", {})
-    broker_host = protocol_settings.get("broker_host", MQTT_BROKER_HOST)
-    broker_port = int(protocol_settings.get("broker_port", MQTT_BROKER_PORT))
-    status_topic = protocol_settings.get("status_topic", MQTT_STATUS_TOPIC)
-    command_topic = protocol_settings.get("command_topic", MQTT_COMMAND_TOPIC)
-    username = protocol_settings.get("username", MQTT_USERNAME)
-    password = protocol_settings.get("password", MQTT_PASSWORD)
-    robotdog_mqtt_client = RobotDogMQTTClient(
-        broker_host=broker_host,
-        broker_port=broker_port,
-        status_topic=status_topic,
-        command_topic=command_topic,
-        username=username,
-        password=password,
-    )
-    asyncio.create_task(robotdog_mqtt_client.connect())
-    asyncio.create_task(update_device_phase_loop())
-
-@app.get("/robot/status")
-async def get_robot_status():
-    if robotdog_mqtt_client is None or not robotdog_mqtt_client.connected:
-        raise HTTPException(status_code=503, detail="Device not connected")
-    status = robotdog_mqtt_client.get_status()
-    if status is None:
-        return JSONResponse({"status": "unknown"}, status_code=200)
-    return JSONResponse(content=status, status_code=200)
-
-@app.post("/robot/command")
-async def post_robot_command(cmd: CommandReq):
-    if robotdog_mqtt_client is None or not robotdog_mqtt_client.connected:
-        raise HTTPException(status_code=503, detail="Device not connected")
-    command = cmd.command.lower()
-    if command not in SUPPORTED_COMMANDS:
-        raise HTTPException(status_code=400, detail=f"Unsupported command: {command}")
+async def get_edgedevice(api) -> Dict[str, Any]:
+    group = "shifu.edgenesis.io"
+    version = "v1alpha1"
+    plural = "edgedevices"
     try:
-        robotdog_mqtt_client.publish_command(command)
-        return {"result": "sent", "command": command}
-    except Exception as ex:
-        raise HTTPException(status_code=500, detail=str(ex))
+        obj = api.get_namespaced_custom_object(
+            group=group,
+            version=version,
+            namespace=EDGEDEVICE_NAMESPACE,
+            plural=plural,
+            name=EDGEDEVICE_NAME,
+        )
+        return obj
+    except ApiException as e:
+        logger.error(f"Could not fetch EdgeDevice: {e}")
+        return {}
+
+# ConfigMap instructions
+def load_instruction_settings() -> Dict[str, Any]:
+    try:
+        with open(CONFIG_MAP_INSTRUCTION_PATH, "r") as f:
+            data = yaml.safe_load(f)
+            return data if data else {}
+    except Exception as e:
+        logger.warning(f"Could not load instruction settings: {e}")
+        return {}
+
+# DeviceShifu implementation
+class RobotDogDeviceShifu:
+    def __init__(self):
+        self.k8s_api = get_k8s_api()
+        self.mqtt_connected = False
+        self.status_payload = {"status": "unknown"}
+        self.mqtt_client = None
+        self.settings = load_instruction_settings()
+        self.mqtt_status_task = None
+        self.mqtt_command_lock = asyncio.Lock()
+
+    async def update_phase(self, phase: str):
+        await update_edgedevice_phase(self.k8s_api, phase)
+
+    async def start_mqtt(self):
+        while True:
+            try:
+                async with MQTTClient(
+                    hostname=MQTT_BROKER_HOST,
+                    port=MQTT_BROKER_PORT,
+                    username=MQTT_USERNAME if MQTT_USERNAME else None,
+                    password=MQTT_PASSWORD if MQTT_PASSWORD else None,
+                    client_id=f"shifu-robotdog-{EDGEDEVICE_NAME}"
+                ) as client:
+                    self.mqtt_client = client
+                    self.mqtt_connected = True
+                    await self.update_phase(PHASE_RUNNING)
+                    logger.info("Connected to MQTT broker.")
+
+                    async with client.filtered_messages(MQTT_TOPIC_STATUS) as messages:
+                        await client.subscribe(MQTT_TOPIC_STATUS)
+                        async for msg in messages:
+                            try:
+                                self.status_payload = json.loads(msg.payload.decode())
+                                logger.info(f"Received status: {self.status_payload}")
+                            except Exception as e:
+                                logger.warning(f"Invalid status payload: {e}")
+
+            except MqttError as e:
+                self.mqtt_connected = False
+                await self.update_phase(PHASE_FAILED)
+                logger.error(f"MQTT connection error: {e}")
+                await asyncio.sleep(5)
+            except Exception as e:
+                self.mqtt_connected = False
+                await self.update_phase(PHASE_FAILED)
+                logger.error(f"MQTT fatal error: {e}")
+                await asyncio.sleep(5)
+
+    async def send_command(self, command: str) -> bool:
+        if not self.mqtt_connected or self.mqtt_client is None:
+            logger.error("MQTT not connected.")
+            return False
+        async with self.mqtt_command_lock:
+            payload = json.dumps({"command": command})
+            try:
+                await self.mqtt_client.publish(MQTT_TOPIC_COMMAND, payload)
+                logger.info(f"Published command: {payload}")
+                return True
+            except Exception as e:
+                logger.error(f"Failed to publish command: {e}")
+                return False
+
+    async def get_status(self) -> Dict[str, Any]:
+        # Return last known status
+        return self.status_payload
+
+    def get_instruction_settings(self, api_name: str) -> Dict[str, Any]:
+        # Parse protocolPropertyList for api_name
+        api_settings = self.settings.get(api_name, {})
+        return api_settings.get("protocolPropertyList", {})
+
+# HTTP Server
+robot_shifu = RobotDogDeviceShifu()
+routes = web.RouteTableDef()
+
+@routes.get("/robot/status")
+async def get_robot_status(request):
+    # Optionally use instruction settings
+    _settings = robot_shifu.get_instruction_settings("robot_status")
+    status = await robot_shifu.get_status()
+    return web.json_response(status)
+
+@routes.post("/robot/command")
+async def post_robot_command(request):
+    # Optionally use instruction settings
+    _settings = robot_shifu.get_instruction_settings("robot_command")
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "Invalid JSON request body"}, status=400)
+    command = body.get("command", "").lower()
+    if command not in ALLOWED_COMMANDS:
+        return web.json_response({"error": f"Invalid command: {command}"}, status=400)
+    success = await robot_shifu.send_command(command)
+    if success:
+        return web.json_response({"result": "success"})
+    else:
+        return web.json_response({"error": "Failed to send command"}, status=500)
+
+async def healthz(request):
+    return web.Response(text="ok")
+
+routes.get("/healthz")(healthz)
+
+async def start_background_tasks(app):
+    # Start MQTT listener
+    app['mqtt_task'] = asyncio.create_task(robot_shifu.start_mqtt())
+
+async def cleanup_background_tasks(app):
+    app['mqtt_task'].cancel()
+    try:
+        await app['mqtt_task']
+    except asyncio.CancelledError:
+        pass
+
+def main():
+    app = web.Application()
+    app.add_routes(routes)
+    app.on_startup.append(start_background_tasks)
+    app.on_cleanup.append(cleanup_background_tasks)
+
+    loop = asyncio.get_event_loop()
+
+    # Graceful shutdown
+    def shutdown():
+        for task in asyncio.Task.all_tasks(loop):
+            task.cancel()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, shutdown)
+
+    try:
+        web.run_app(app, host=HTTP_SERVER_HOST, port=HTTP_SERVER_PORT)
+    except Exception as e:
+        logger.error(f"HTTP server exited: {e}")
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host=HTTP_SERVER_HOST, port=HTTP_SERVER_PORT)
+    main()
