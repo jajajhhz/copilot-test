@@ -1,563 +1,479 @@
 #include <iostream>
-#include <fstream>
 #include <sstream>
+#include <fstream>
 #include <string>
-#include <vector>
-#include <thread>
-#include <mutex>
-#include <atomic>
-#include <unordered_map>
-#include <map>
-#include <chrono>
-#include <condition_variable>
 #include <cstdlib>
-#include <cstring>
-#include <csignal>
+#include <thread>
+#include <atomic>
+#include <chrono>
+#include <unordered_map>
+#include <vector>
+#include <mutex>
+#include <condition_variable>
+#include <algorithm>
 #include <fcntl.h>
 #include <termios.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <sys/inotify.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <nlohmann/json.hpp>
 #include <yaml-cpp/yaml.h>
 #include <curl/curl.h>
-#include <nlohmann/json.hpp>
 
-// ---- Configuration: Environment Variables ----
-#define ENV_DEVICE_NAME "EDGEDEVICE_NAME"
-#define ENV_DEVICE_NAMESPACE "EDGEDEVICE_NAMESPACE"
-#define ENV_HTTP_HOST "HTTP_SERVER_HOST"
-#define ENV_HTTP_PORT "HTTP_SERVER_PORT"
-#define ENV_UART_PORT "UART_PORT"
-#define ENV_UART_BAUD "UART_BAUDRATE"
-#define ENV_KUBERNETES_TOKEN_PATH "/var/run/secrets/kubernetes.io/serviceaccount/token"
-#define ENV_KUBERNETES_CA_PATH "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
-#define ENV_KUBERNETES_NAMESPACE_PATH "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
-#define EDGEDEVICE_CRD_GROUP "shifu.edgenesis.io"
-#define EDGEDEVICE_CRD_VERSION "v1alpha1"
-#define EDGEDEVICE_CRD_KIND "EdgeDevice"
-#define EDGEDEVICE_CRD_PLURAL "edgedevices"
-#define CONFIGMAP_INSTRUCTIONS_PATH "/etc/edgedevice/config/instructions"
+// Single-header HTTP server library (C++11, MIT License)
+// https://github.com/yhirose/cpp-httplib
+#include "httplib.h"
 
-// ---- Simple HTTP Server (lightweight, no third-party library) ----
-#define HTTP_BUFFER_SIZE 8192
-#define MAX_CONNECTIONS 8
+using json = nlohmann::json;
 
-// ---- UART Communication ----
-class UARTSession {
+// --- UART Communication ---
+
+class UARTDevice {
 public:
-    UARTSession(const std::string& port, int baudrate)
-        : port_(port), baudrate_(baudrate), fd_(-1) {}
+    UARTDevice(const std::string& dev, int baud) : device_path(dev), baud_rate(baud), fd(-1) {}
 
-    bool open() {
-        fd_ = ::open(port_.c_str(), O_RDWR | O_NOCTTY | O_SYNC);
-        if (fd_ < 0) return false;
+    bool open_port() {
+        fd = open(device_path.c_str(), O_RDWR | O_NOCTTY | O_SYNC);
+        if (fd < 0) return false;
         struct termios tty;
-        memset(&tty, 0, sizeof tty);
-        if (tcgetattr(fd_, &tty) != 0) return false;
-        cfsetospeed(&tty, baudrate_);
-        cfsetispeed(&tty, baudrate_);
+        if (tcgetattr(fd, &tty) != 0) { close(fd); fd = -1; return false; }
+        cfsetospeed(&tty, baud_rate_to_flag(baud_rate));
+        cfsetispeed(&tty, baud_rate_to_flag(baud_rate));
         tty.c_cflag = (tty.c_cflag & ~CSIZE) | CS8;     // 8-bit chars
         tty.c_iflag &= ~IGNBRK;         // disable break processing
         tty.c_lflag = 0;                // no signaling chars, no echo,
         tty.c_oflag = 0;                // no remapping, no delays
-        tty.c_cc[VMIN]  = 1;            // read doesn't block
+        tty.c_cc[VMIN]  = 0;            // read doesn't block
         tty.c_cc[VTIME] = 5;            // 0.5 seconds read timeout
-        tty.c_iflag &= ~(IXON | IXOFF | IXANY); // shut off xon/xoff ctrl
-        tty.c_cflag |= (CLOCAL | CREAD);// ignore modem controls,
+        tty.c_cflag |= (CLOCAL | CREAD);// ignore modem controls, enable reading
         tty.c_cflag &= ~(PARENB | PARODD);      // shut off parity
         tty.c_cflag &= ~CSTOPB;
         tty.c_cflag &= ~CRTSCTS;
-        if (tcsetattr(fd_, TCSANOW, &tty) != 0) return false;
+        if (tcsetattr(fd, TCSANOW, &tty) != 0) { close(fd); fd = -1; return false; }
         return true;
     }
 
-    void close() {
-        if (fd_ >= 0) {
-            ::close(fd_);
-            fd_ = -1;
+    void close_port() {
+        if (fd >= 0) { close(fd); fd = -1; }
+    }
+
+    bool is_open() const { return fd >= 0; }
+
+    int write_data(const std::string& data) {
+        if (fd < 0) return -1;
+        return ::write(fd, data.data(), data.size());
+    }
+
+    int read_data(char* buf, size_t bufsize) {
+        if (fd < 0) return -1;
+        return ::read(fd, buf, bufsize);
+    }
+
+    ~UARTDevice() { close_port(); }
+
+private:
+    std::string device_path;
+    int baud_rate;
+    int fd;
+
+    static speed_t baud_rate_to_flag(int baud)
+    {
+        switch (baud) {
+            case 9600: return B9600;
+            case 19200: return B19200;
+            case 38400: return B38400;
+            case 57600: return B57600;
+            case 115200: return B115200;
+            default: return B9600;
         }
     }
-
-    ssize_t write(const uint8_t* data, size_t len) {
-        if (fd_ < 0) return -1;
-        return ::write(fd_, data, len);
-    }
-
-    ssize_t read(uint8_t* buf, size_t len) {
-        if (fd_ < 0) return -1;
-        return ::read(fd_, buf, len);
-    }
-
-    ~UARTSession() { close(); }
-private:
-    std::string port_;
-    int baudrate_;
-    int fd_;
 };
 
-// ---- Simple HTTP base64 utility ----
-static const std::string base64_chars =
-             "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-             "abcdefghijklmnopqrstuvwxyz"
-             "0123456789+/";
+// --- EdgeDevice CRD Kubernetes API Client ---
 
-std::string base64_encode(unsigned char const* bytes_to_encode, size_t in_len) {
-    std::string ret;
-    int i = 0, j = 0;
-    unsigned char char_array_3[3], char_array_4[4];
-
-    while (in_len--) {
-        char_array_3[i++] = *(bytes_to_encode++);
-        if (i == 3) {
-            char_array_4[0] = (char_array_3[0] & 0xfc) >> 2;
-            char_array_4[1] = ((char_array_3[0] & 0x03) << 4) + ((char_array_3[1] & 0xf0) >> 4);
-            char_array_4[2] = ((char_array_3[1] & 0x0f) << 2) + ((char_array_3[2] & 0xc0) >> 6);
-            char_array_4[3] = char_array_3[2] & 0x3f;
-            for(i = 0; (i <4) ; i++) ret += base64_chars[char_array_4[i]];
-            i = 0;
-        }
-    }
-
-    if (i) {
-        for(j = i; j < 3; j++) char_array_3[j] = '\0';
-        char_array_4[0] = ( char_array_3[0] & 0xfc ) >> 2;
-        char_array_4[1] = ( ( char_array_3[0] & 0x03 ) << 4 ) + ( ( char_array_3[1] & 0xf0 ) >> 4 );
-        char_array_4[2] = ( ( char_array_3[1] & 0x0f ) << 2 ) + ( ( char_array_3[2] & 0xc0 ) >> 6 );
-        char_array_4[3] = char_array_3[2] & 0x3f;
-        for (j = 0; (j < i + 1); j++) ret += base64_chars[char_array_4[j]];
-        while((i++ < 3)) ret += '=';
-    }
-    return ret;
-}
-
-// ---- EdgeDevice CRD Kubernetes REST PATCH ----
-class KubernetesClient {
+class K8sClient {
 public:
-    KubernetesClient() {
-        std::ifstream tokenf(ENV_KUBERNETES_TOKEN_PATH);
-        std::stringstream ss; ss << tokenf.rdbuf();
-        token_ = ss.str();
-        tokenf.close();
+    K8sClient() {
+        token = get_token();
+        ca_cert = get_ca_cert();
+        k8s_host = std::getenv("KUBERNETES_SERVICE_HOST") ? std::getenv("KUBERNETES_SERVICE_HOST") : "kubernetes.default.svc";
+        k8s_port = std::getenv("KUBERNETES_SERVICE_PORT") ? std::getenv("KUBERNETES_SERVICE_PORT") : "443";
+        curl_global_init(CURL_GLOBAL_ALL);
+    }
+    ~K8sClient() { curl_global_cleanup(); }
 
-        ca_path_ = ENV_KUBERNETES_CA_PATH;
-        namespace_ = getenv("EDGEDEVICE_NAMESPACE") ? getenv("EDGEDEVICE_NAMESPACE") : get_current_namespace();
-        api_server_ = getenv("KUBERNETES_SERVICE_HOST") ? getenv("KUBERNETES_SERVICE_HOST") : "kubernetes.default.svc";
-        api_port_ = getenv("KUBERNETES_SERVICE_PORT") ? getenv("KUBERNETES_SERVICE_PORT") : "443";
+    json get_edgedevice(const std::string& ns, const std::string& name) {
+        std::string url = "https://" + k8s_host + ":" + k8s_port + "/apis/shifu.edgenesis.io/v1alpha1/namespaces/" + ns + "/edgedevices/" + name;
+        std::string resp;
+        http_req("GET", url, "", resp);
+        if (!resp.empty()) return json::parse(resp, nullptr, false);
+        return json();
     }
 
-    std::string get_current_namespace() {
-        std::ifstream nsf(ENV_KUBERNETES_NAMESPACE_PATH);
-        std::string ns;
-        getline(nsf, ns);
-        nsf.close();
-        return ns;
+    bool patch_status(const std::string& ns, const std::string& name, const std::string& phase) {
+        std::string url = "https://" + k8s_host + ":" + k8s_port + "/apis/shifu.edgenesis.io/v1alpha1/namespaces/" + ns + "/edgedevices/" + name + "/status";
+        json patch = {
+            {"status", { {"edgeDevicePhase", phase } } }
+        };
+        std::string resp;
+        return http_req("PATCH", url, patch.dump(), resp, "application/merge-patch+json");
     }
 
-    // PATCH status.edgeDevicePhase in EdgeDevice CR
-    bool patch_edge_device_phase(const std::string& dev_name, const std::string& ns, const std::string& phase) {
-        std::string url = "https://" + api_server_ + ":" + api_port_ +
-            "/apis/" EDGEDEVICE_CRD_GROUP "/" EDGEDEVICE_CRD_VERSION "/namespaces/" + ns + "/" EDGEDEVICE_CRD_PLURAL "/" + dev_name + "/status";
-        std::string payload = R"({"status": {"edgeDevicePhase": ")" + phase + R"("}})";
+private:
+    std::string token, ca_cert, k8s_host, k8s_port;
+
+    static std::string get_token() {
+        std::ifstream f("/var/run/secrets/kubernetes.io/serviceaccount/token");
+        std::stringstream ss;
+        ss << f.rdbuf();
+        return ss.str();
+    }
+    static std::string get_ca_cert() {
+        std::ifstream f("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt");
+        std::stringstream ss;
+        ss << f.rdbuf();
+        return ss.str();
+    }
+    bool http_req(const std::string& method, const std::string& url, const std::string& body, std::string& out, const std::string& content_type = "application/json") {
         CURL* curl = curl_easy_init();
+        if (!curl) return false;
         struct curl_slist* headers = nullptr;
-        headers = curl_slist_append(headers, ("Authorization: Bearer " + token_).c_str());
-        headers = curl_slist_append(headers, "Accept: application/json");
-        headers = curl_slist_append(headers, "Content-Type: application/merge-patch+json");
+        headers = curl_slist_append(headers, ("Authorization: Bearer " + token).c_str());
+        headers = curl_slist_append(headers, ("Content-Type: " + content_type).c_str());
         curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-        curl_easy_setopt(curl, CURLOPT_SSLCERTTYPE, "PEM");
-        curl_easy_setopt(curl, CURLOPT_CAINFO, ca_path_.c_str());
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payload.c_str());
-        curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PATCH");
         curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, [](void*, size_t sz, size_t nm, void*){ return sz*nm; });
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, nullptr);
-        long http_code = 0;
-        auto res = curl_easy_perform(curl);
-        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+        curl_easy_setopt(curl, CURLOPT_CAINFO, "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt");
+        if (method == "PATCH") curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PATCH");
+        if (method == "POST") curl_easy_setopt(curl, CURLOPT_POST, 1L);
+        if (method == "PATCH" || method == "POST") {
+            curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
+        }
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_fn);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &out);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+        CURLcode res = curl_easy_perform(curl);
         curl_slist_free_all(headers);
         curl_easy_cleanup(curl);
-        return (res == CURLE_OK && http_code >= 200 && http_code < 300);
+        return res == CURLE_OK;
     }
+    static size_t write_fn(void* ptr, size_t size, size_t nmemb, void* userdata) {
+        ((std::string*)userdata)->append((char*)ptr, size * nmemb);
+        return size * nmemb;
+    }
+};
 
-    // GET EdgeDevice CR to get .spec.address
-    std::string get_device_address(const std::string& dev_name, const std::string& ns) {
-        std::string url = "https://" + api_server_ + ":" + api_port_ +
-            "/apis/" EDGEDEVICE_CRD_GROUP "/" EDGEDEVICE_CRD_VERSION "/namespaces/" + ns + "/" EDGEDEVICE_CRD_PLURAL "/" + dev_name;
-        CURL* curl = curl_easy_init();
-        std::string response;
-        struct curl_slist* headers = nullptr;
-        headers = curl_slist_append(headers, ("Authorization: Bearer " + token_).c_str());
-        headers = curl_slist_append(headers, "Accept: application/json");
-        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-        curl_easy_setopt(curl, CURLOPT_SSLCERTTYPE, "PEM");
-        curl_easy_setopt(curl, CURLOPT_CAINFO, ca_path_.c_str());
-        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, +[](void* ptr, size_t sz, size_t nm, void* userdata) -> size_t {
-            std::string* resp = reinterpret_cast<std::string*>(userdata);
-            resp->append((char*)ptr, sz*nm);
-            return sz*nm;
-        });
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-        auto res = curl_easy_perform(curl);
-        curl_slist_free_all(headers);
-        curl_easy_cleanup(curl);
-        if (res != CURLE_OK) return "";
+// --- ConfigMap Loader ---
+
+struct APISettings {
+    std::unordered_map<std::string, std::string> protocolPropertyList;
+};
+
+class ConfigLoader {
+public:
+    bool load(const std::string& path) {
         try {
-            auto j = nlohmann::json::parse(response);
-            if (j.contains("spec") && j["spec"].contains("address")) return j["spec"]["address"];
-        } catch (...) { }
-        return "";
+            YAML::Node root = YAML::LoadFile(path);
+            for (auto it = root.begin(); it != root.end(); ++it) {
+                APISettings setting;
+                if (it->second["protocolPropertyList"]) {
+                    for (auto pit = it->second["protocolPropertyList"].begin(); pit != it->second["protocolPropertyList"].end(); ++pit) {
+                        setting.protocolPropertyList[pit->first.as<std::string>()] = pit->second.as<std::string>();
+                    }
+                }
+                apis[it->first.as<std::string>()] = setting;
+            }
+            return true;
+        } catch (...) { return false; }
+    }
+    const APISettings* get_api(const std::string& name) const {
+        auto it = apis.find(name);
+        if (it == apis.end()) return nullptr;
+        return &it->second;
     }
 private:
-    std::string token_;
-    std::string ca_path_;
-    std::string namespace_;
-    std::string api_server_;
-    std::string api_port_;
+    std::unordered_map<std::string, APISettings> apis;
 };
 
-// ---- ConfigMap YAML instruction loader ----
-struct InstructionSettings {
-    std::map<std::string, std::string> protocolPropertyList;
+// --- Camera State Management ---
+
+enum class CameraVideoState {
+    STOPPED,
+    RUNNING
 };
 
-std::map<std::string, InstructionSettings> load_instruction_settings(const std::string& path) {
-    std::map<std::string, InstructionSettings> settings;
-    try {
-        YAML::Node config = YAML::LoadFile(path);
-        for (auto it = config.begin(); it != config.end(); ++it) {
-            std::string api = it->first.as<std::string>();
-            auto node = it->second;
-            if (node["protocolPropertyList"]) {
-                InstructionSettings ins;
-                for (auto jt = node["protocolPropertyList"].begin(); jt != node["protocolPropertyList"].end(); ++jt) {
-                    ins.protocolPropertyList[jt->first.as<std::string>()] = jt->second.as<std::string>();
-                }
-                settings[api] = ins;
-            }
-        }
-    } catch (...) { }
-    return settings;
-}
-
-// ---- Camera State Management ----
-enum class CameraStatus {
-    PENDING,
-    RUNNING,
-    FAILED,
-    UNKNOWN
+struct ImageData {
+    std::vector<uint8_t> image;
+    std::string timestamp;
 };
 
-struct CameraFrame {
-    std::vector<uint8_t> data;
-    std::string mime_type;
-    uint64_t timestamp;
+struct VideoFrame {
+    std::vector<uint8_t> frame;
+    std::string timestamp;
 };
 
-// ---- Camera Device Simulator (UART) ----
-class CameraDevice {
+class CameraController {
 public:
-    CameraDevice(const std::string& uart_port, int baudrate)
-        : uart_port_(uart_port), baudrate_(baudrate), streaming_(false), last_frame_() {}
+    CameraController(UARTDevice& uart)
+        : uartdev(uart), video_state(CameraVideoState::STOPPED), exit_flag(false)
+    {}
 
-    bool connect() {
-        uart_.reset(new UARTSession(uart_port_, baudrate_));
-        return uart_->open();
-    }
-
-    void disconnect() {
-        uart_.reset();
-    }
-
-    // Command: Capture an image
-    bool capture_image(CameraFrame& frame) {
-        const char* cmd = "CAPTURE\r\n";
-        if (uart_) uart_->write(reinterpret_cast<const uint8_t*>(cmd), strlen(cmd));
-        // Simulate: Read image of random size (JPEG), 64KB max
-        std::vector<uint8_t> img(10240 + (std::rand() % 40960), 0xFF);
-        // Insert JPEG header
-        img[0] = 0xFF; img[1] = 0xD8; img[img.size()-2] = 0xFF; img[img.size()-1] = 0xD9;
-        frame.data = img;
-        frame.mime_type = "image/jpeg";
-        frame.timestamp = std::chrono::system_clock::now().time_since_epoch().count();
-        std::lock_guard<std::mutex> lock(mutex_);
-        last_frame_ = frame;
-        return true;
-    }
-
-    // Command: Start video streaming
     bool start_video() {
-        const char* cmd = "START_VIDEO\r\n";
-        if (uart_) uart_->write(reinterpret_cast<const uint8_t*>(cmd), strlen(cmd));
-        streaming_ = true;
+        std::unique_lock<std::mutex> lock(mtx);
+        if (video_state == CameraVideoState::RUNNING) return true;
+        // send UART command to start video
+        if (!uartdev.is_open()) return false;
+        if (uartdev.write_data("START_VIDEO\n") < 0) return false;
+        video_state = CameraVideoState::RUNNING;
+        // spawn video thread
+        exit_flag = false;
+        video_thread = std::thread([this](){ this->video_loop(); });
         return true;
     }
 
-    // Command: Stop video streaming
     bool stop_video() {
-        const char* cmd = "STOP_VIDEO\r\n";
-        if (uart_) uart_->write(reinterpret_cast<const uint8_t*>(cmd), strlen(cmd));
-        streaming_ = false;
+        std::unique_lock<std::mutex> lock(mtx);
+        if (video_state == CameraVideoState::STOPPED) return true;
+        if (!uartdev.is_open()) return false;
+        if (uartdev.write_data("STOP_VIDEO\n") < 0) return false;
+        video_state = CameraVideoState::STOPPED;
+        exit_flag = true;
+        cv.notify_all();
+        if (video_thread.joinable()) video_thread.join();
         return true;
     }
 
-    // "Streaming" video: Simulate MJPEG stream
-    void simulate_video_stream(std::function<void(const CameraFrame&)> frame_cb, std::atomic<bool>& stop_flag) {
-        while (!stop_flag.load()) {
-            CameraFrame frame;
-            capture_image(frame);
-            frame_cb(frame);
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
+    bool capture_image() {
+        std::unique_lock<std::mutex> lock(mtx);
+        if (!uartdev.is_open()) return false;
+        if (uartdev.write_data("CAPTURE_IMAGE\n") < 0) return false;
+        std::vector<uint8_t> img;
+        std::string ts = now_str();
+        // Simulate: read image (in real world, parse UART protocol and image size!)
+        char buf[4096];
+        int n = uartdev.read_data(buf, sizeof(buf));
+        if (n > 0) img.insert(img.end(), buf, buf+n);
+        last_image = {img, ts};
+        return !img.empty();
     }
 
-    CameraFrame get_last_frame() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return last_frame_;
+    ImageData get_last_image() {
+        std::unique_lock<std::mutex> lock(mtx);
+        return last_image;
     }
 
-    bool is_streaming() const { return streaming_; }
-
-private:
-    std::string uart_port_;
-    int baudrate_;
-    std::unique_ptr<UARTSession> uart_;
-    std::atomic<bool> streaming_;
-    CameraFrame last_frame_;
-    std::mutex mutex_;
-};
-
-
-// ---- HTTP Server ----
-class HttpServer {
-public:
-    HttpServer(const std::string& host, uint16_t port, CameraDevice* camera)
-        : host_(host), port_(port), camera_(camera), should_stop_(false) {}
-
-    void start() {
-        server_thread_ = std::thread([this]() { this->run(); });
-    }
-
-    void stop() {
-        should_stop_ = true;
-        if (server_thread_.joinable()) server_thread_.join();
-    }
-
-private:
-    std::string host_;
-    uint16_t port_;
-    CameraDevice* camera_;
-    std::atomic<bool> should_stop_;
-    std::thread server_thread_;
-
-    void run() {
-        int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-        int opt = 1;
-        setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt));
-        sockaddr_in address;
-        address.sin_family = AF_INET;
-        address.sin_addr.s_addr = INADDR_ANY; // listen all
-        address.sin_port = htons(port_);
-        bind(server_fd, (struct sockaddr*)&address, sizeof(address));
-        listen(server_fd, MAX_CONNECTIONS);
-        while (!should_stop_) {
-            sockaddr_in client_addr;
-            socklen_t client_len = sizeof(client_addr);
-            int client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &client_len);
-            if (client_fd < 0) continue;
-            std::thread(&HttpServer::handle_client, this, client_fd).detach();
-        }
-        close(server_fd);
-    }
-
-    void handle_client(int client_fd) {
-        char buffer[HTTP_BUFFER_SIZE];
-        ssize_t len = read(client_fd, buffer, sizeof(buffer)-1);
-        if (len <= 0) { close(client_fd); return; }
-        buffer[len] = '\0';
-        std::string req(buffer);
-        std::string method, path, version;
-        std::istringstream iss(req);
-        iss >> method >> path >> version;
-        // Only support GET/POST
-        if (method == "GET" && path == "/camera/image") {
-            handle_get_camera_image(client_fd);
-        } else if (method == "POST" && (path == "/camera/capture" || path == "/commands/capture")) {
-            handle_post_camera_capture(client_fd);
-        } else if (method == "POST" && (path == "/camera/video/start" || path == "/commands/video/start")) {
-            handle_post_video_start(client_fd);
-        } else if (method == "POST" && (path == "/camera/video/stop" || path == "/commands/video/stop")) {
-            handle_post_video_stop(client_fd);
-        } else if (method == "GET" && path == "/camera/video") {
-            handle_get_video_stream(client_fd);
-        } else {
-            respond_404(client_fd);
-        }
-        close(client_fd);
-    }
-
-    void handle_get_camera_image(int fd) {
-        CameraFrame frame = camera_->get_last_frame();
-        if (frame.data.empty()) {
-            respond_json(fd, 404, R"({"error":"No image found"})");
-            return;
-        }
-        std::string header = "HTTP/1.1 200 OK\r\nContent-Type: " + frame.mime_type +
-            "\r\nContent-Length: " + std::to_string(frame.data.size()) + "\r\n\r\n";
-        send(fd, header.c_str(), header.length(), 0);
-        send(fd, reinterpret_cast<char*>(frame.data.data()), frame.data.size(), 0);
-    }
-
-    void handle_post_camera_capture(int fd) {
-        CameraFrame frame;
-        if (!camera_->capture_image(frame)) {
-            respond_json(fd, 500, R"({"status":"fail","msg":"Capture failed"})");
-            return;
-        }
-        nlohmann::json resp = {
-            {"status", "success"},
-            {"mime_type", frame.mime_type},
-            {"timestamp", frame.timestamp},
-            {"data", base64_encode(frame.data.data(), frame.data.size())}
-        };
-        respond_json(fd, 200, resp.dump());
-    }
-
-    void handle_post_video_start(int fd) {
-        bool ok = camera_->start_video();
-        nlohmann::json resp = {
-            {"status", ok ? "started" : "failed"},
-            {"stream_url", "/camera/video"}
-        };
-        respond_json(fd, 200, resp.dump());
-    }
-
-    void handle_post_video_stop(int fd) {
-        bool ok = camera_->stop_video();
-        nlohmann::json resp = {
-            {"status", ok ? "stopped" : "failed"}
-        };
-        respond_json(fd, 200, resp.dump());
-    }
-
-    void handle_get_video_stream(int fd) {
-        if (!camera_->is_streaming()) {
-            respond_json(fd, 400, R"({"error":"Video not streaming"})");
-            return;
-        }
-        std::string boundary = "mjpegstream";
-        std::string header = "HTTP/1.1 200 OK\r\n"
-            "Content-Type: multipart/x-mixed-replace; boundary=" + boundary + "\r\n"
-            "Cache-Control: no-cache\r\n"
-            "\r\n";
-        send(fd, header.c_str(), header.size(), 0);
-        std::atomic<bool> stop_flag(false);
-        std::thread stream_thread([&](){
-            camera_->simulate_video_stream([&](const CameraFrame& frame){
-                std::ostringstream part;
-                part << "--" << boundary << "\r\n"
-                     << "Content-Type: " << frame.mime_type << "\r\n"
-                     << "Content-Length: " << frame.data.size() << "\r\n\r\n";
-                send(fd, part.str().c_str(), part.str().size(), 0);
-                send(fd, reinterpret_cast<const char*>(frame.data.data()), frame.data.size(), 0);
-                send(fd, "\r\n", 2, 0);
-            }, stop_flag);
-        });
-        // Let it stream for up to 30 seconds or until client closes
-        auto t0 = std::chrono::steady_clock::now();
-        char tmpbuf[32];
-        while (true) {
-            ssize_t n = recv(fd, tmpbuf, sizeof(tmpbuf), MSG_DONTWAIT);
-            if (n == 0 || n < 0) break;
-            if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(30)) break;
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
-        stop_flag = true;
-        stream_thread.join();
-    }
-
-    void respond_json(int fd, int code, const std::string& body) {
-        std::ostringstream oss;
-        oss << "HTTP/1.1 " << code << " "
-            << (code==200 ? "OK":"Error") << "\r\n"
-            << "Content-Type: application/json\r\n"
-            << "Content-Length: " << body.size() << "\r\n\r\n"
-            << body;
-        send(fd, oss.str().c_str(), oss.str().size(), 0);
-    }
-
-    void respond_404(int fd) {
-        respond_json(fd, 404, R"({"error":"Not found"})");
-    }
-};
-
-
-// ---- Main DeviceShifu Entrypoint ----
-int main() {
-    // Load env config
-    std::string dev_name = getenv(ENV_DEVICE_NAME) ? getenv(ENV_DEVICE_NAME) : "";
-    std::string dev_ns = getenv(ENV_DEVICE_NAMESPACE) ? getenv(ENV_DEVICE_NAMESPACE) : "";
-    std::string uart_port = getenv(ENV_UART_PORT) ? getenv(ENV_UART_PORT) : "/dev/ttyS0";
-    std::string http_host = getenv(ENV_HTTP_HOST) ? getenv(ENV_HTTP_HOST) : "0.0.0.0";
-    uint16_t http_port = getenv(ENV_HTTP_PORT) ? (uint16_t)atoi(getenv(ENV_HTTP_PORT)) : 8080;
-    int uart_baud = getenv(ENV_UART_BAUD) ? atoi(getenv(ENV_UART_BAUD)) : B115200;
-
-    // Load ConfigMap instructions
-    auto instructions = load_instruction_settings(CONFIGMAP_INSTRUCTIONS_PATH);
-
-    // Setup K8s client
-    KubernetesClient kube;
-    std::string device_address = kube.get_device_address(dev_name, dev_ns);
-
-    // CameraDevice
-    CameraDevice camera(uart_port, uart_baud);
-
-    // EdgeDevice phase management
-    CameraStatus cam_status = CameraStatus::PENDING;
-    if (camera.connect()) {
-        cam_status = CameraStatus::RUNNING;
-    } else {
-        cam_status = CameraStatus::FAILED;
-    }
-    // PATCH status
-    std::string phase_str;
-    switch (cam_status) {
-        case CameraStatus::PENDING: phase_str = "Pending"; break;
-        case CameraStatus::RUNNING: phase_str = "Running"; break;
-        case CameraStatus::FAILED: phase_str = "Failed"; break;
-        default: phase_str = "Unknown"; break;
-    }
-    kube.patch_edge_device_phase(dev_name, dev_ns, phase_str);
-
-    // HTTP server
-    HttpServer server(http_host, http_port, &camera);
-    server.start();
-
-    // Monitor device status (simulate edge device status updates)
-    std::thread([&](){
-        while (true) {
-            std::this_thread::sleep_for(std::chrono::seconds(15));
-            CameraStatus new_status = camera.connect() ? CameraStatus::RUNNING : CameraStatus::FAILED;
-            if (new_status != cam_status) {
-                cam_status = new_status;
-                std::string phase;
-                switch (cam_status) {
-                    case CameraStatus::PENDING: phase = "Pending"; break;
-                    case CameraStatus::RUNNING: phase = "Running"; break;
-                    case CameraStatus::FAILED: phase = "Failed"; break;
-                    default: phase = "Unknown"; break;
-                }
-                kube.patch_edge_device_phase(dev_name, dev_ns, phase);
+    void video_loop() {
+        while (!exit_flag) {
+            // Simulate: read video frames from UART
+            char buf[4096];
+            int n = uartdev.read_data(buf, sizeof(buf));
+            if (n > 0) {
+                std::vector<uint8_t> frame(buf, buf+n);
+                std::string ts = now_str();
+                std::unique_lock<std::mutex> lock(mtx);
+                latest_video_frame = {frame, ts};
+                cv.notify_all();
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(30));
             }
         }
-    }).detach();
+    }
 
-    // Graceful shutdown
-    std::signal(SIGTERM, [](int){ exit(0); });
-    std::signal(SIGINT, [](int){ exit(0); });
+    VideoFrame get_latest_video_frame() {
+        std::unique_lock<std::mutex> lock(mtx);
+        return latest_video_frame;
+    }
 
-    while (true) std::this_thread::sleep_for(std::chrono::seconds(600));
+    bool is_video_running() {
+        std::unique_lock<std::mutex> lock(mtx);
+        return video_state == CameraVideoState::RUNNING;
+    }
+
+    void shutdown() {
+        stop_video();
+    }
+
+private:
+    UARTDevice& uartdev;
+    std::mutex mtx;
+    std::condition_variable cv;
+    CameraVideoState video_state;
+    std::thread video_thread;
+    std::atomic<bool> exit_flag;
+    ImageData last_image;
+    VideoFrame latest_video_frame;
+
+    static std::string now_str() {
+        std::time_t t = std::time(nullptr);
+        char buf[32];
+        strftime(buf, sizeof(buf), "%FT%TZ", gmtime(&t));
+        return buf;
+    }
+};
+
+// --- Main Application ---
+
+int main() {
+    // --- Environment ---
+    const char* ns_env = std::getenv("EDGEDEVICE_NAMESPACE");
+    const char* name_env = std::getenv("EDGEDEVICE_NAME");
+    if (!ns_env || !name_env) {
+        std::cerr << "EDGEDEVICE_NAMESPACE and EDGEDEVICE_NAME must be set." << std::endl;
+        return 1;
+    }
+    std::string edgedevice_ns(ns_env), edgedevice_name(name_env);
+    std::string config_path = "/etc/edgedevice/config/instructions/config.yaml";
+
+    // UART config from env
+    std::string uart_dev  = std::getenv("CAMERA_UART_PORT") ? std::getenv("CAMERA_UART_PORT") : "/dev/ttyUSB0";
+    int uart_baud = std::getenv("CAMERA_UART_BAUD") ? std::stoi(std::getenv("CAMERA_UART_BAUD")) : 115200;
+    // HTTP Server config
+    std::string http_host = std::getenv("HTTP_SERVER_HOST") ? std::getenv("HTTP_SERVER_HOST") : "0.0.0.0";
+    int http_port = std::getenv("HTTP_SERVER_PORT") ? std::stoi(std::getenv("HTTP_SERVER_PORT")) : 8080;
+
+    // --- Load ConfigMap ---
+    ConfigLoader config;
+    config.load(config_path);
+
+    // --- K8s CRD Client ---
+    K8sClient k8s;
+    std::string edgedevice_phase = "Unknown";
+
+    // --- EdgeDevice address ---
+    std::string device_addr;
+    {
+        json dev = k8s.get_edgedevice(edgedevice_ns, edgedevice_name);
+        if (dev.contains("spec") && dev["spec"].contains("address"))
+            device_addr = dev["spec"]["address"];
+    }
+
+    // --- UART Camera ---
+    UARTDevice camera(uart_dev, uart_baud);
+
+    // --- Camera Controller ---
+    CameraController camctl(camera);
+
+    // --- Phase Management Thread ---
+    std::atomic<bool> running{true};
+    std::thread phase_thread([&](){
+        while (running) {
+            std::string new_phase;
+            if (!camera.open_port()) {
+                new_phase = "Pending";
+            } else if (!camera.is_open()) {
+                new_phase = "Failed";
+            } else {
+                new_phase = camctl.is_video_running() ? "Running" : "Pending";
+            }
+            if (edgedevice_phase != new_phase) {
+                k8s.patch_status(edgedevice_ns, edgedevice_name, new_phase);
+                edgedevice_phase = new_phase;
+            }
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+        }
+    });
+
+    // --- HTTP Server ---
+    httplib::Server svr;
+
+    // POST /camera/video/start
+    svr.Post("/camera/video/start", [&](const httplib::Request&, httplib::Response& res) {
+        bool ok = camctl.start_video();
+        json ret = { {"status", ok ? "success":"fail"}, {"phase", ok ? "Running":"Failed"} };
+        res.set_content(ret.dump(), "application/json");
+    });
+
+    // POST /camera/video/stop
+    svr.Post("/camera/video/stop", [&](const httplib::Request&, httplib::Response& res) {
+        bool ok = camctl.stop_video();
+        json ret = { {"status", ok ? "success":"fail"}, {"phase", ok ? "Stopped":"Failed"} };
+        res.set_content(ret.dump(), "application/json");
+    });
+
+    // POST /commands/video/start
+    svr.Post("/commands/video/start", [&](const httplib::Request&, httplib::Response& res) {
+        bool ok = camctl.start_video();
+        json ret = { {"status", ok ? "success":"fail"}, {"phase", ok ? "Running":"Failed"} };
+        res.set_content(ret.dump(), "application/json");
+    });
+
+    // POST /commands/video/stop
+    svr.Post("/commands/video/stop", [&](const httplib::Request&, httplib::Response& res) {
+        bool ok = camctl.stop_video();
+        json ret = { {"status", ok ? "success":"fail"}, {"phase", ok ? "Stopped":"Failed"} };
+        res.set_content(ret.dump(), "application/json");
+    });
+
+    // POST /commands/capture
+    svr.Post("/commands/capture", [&](const httplib::Request&, httplib::Response& res) {
+        bool ok = camctl.capture_image();
+        ImageData img = camctl.get_last_image();
+        json ret = { {"status", ok ? "success": "fail"}, {"timestamp", img.timestamp}, {"image_size", img.image.size()} };
+        res.set_content(ret.dump(), "application/json");
+    });
+
+    // POST /camera/capture
+    svr.Post("/camera/capture", [&](const httplib::Request&, httplib::Response& res) {
+        bool ok = camctl.capture_image();
+        ImageData img = camctl.get_last_image();
+        std::string base64_image = ""; // (implement base64 encode if needed)
+        json ret = { {"status", ok ? "success": "fail"}, {"timestamp", img.timestamp}, {"image_base64", base64_image} };
+        res.set_content(ret.dump(), "application/json");
+    });
+
+    // GET /camera/image
+    svr.Get("/camera/image", [&](const httplib::Request& req, httplib::Response& res) {
+        ImageData img = camctl.get_last_image();
+        if (img.image.empty()) {
+            res.status = 404;
+            res.set_content("No image captured.", "text/plain");
+            return;
+        }
+        res.set_content_provider("image/jpeg", img.image.size(),
+            [img](size_t offset, size_t length, httplib::DataSink& sink) {
+                sink.write((const char*)img.image.data() + offset, length);
+                return true;
+            });
+    });
+
+    // GET /camera/video
+    svr.Get("/camera/video", [&](const httplib::Request&, httplib::Response& res) {
+        if (!camctl.is_video_running()) {
+            res.status = 404;
+            res.set_content("Video not running.", "text/plain");
+            return;
+        }
+        res.set_chunked_content_provider("video/x-motion-jpeg", [&](size_t offset, httplib::DataSink& sink) {
+            while (camctl.is_video_running()) {
+                VideoFrame vf = camctl.get_latest_video_frame();
+                if (!vf.frame.empty()) {
+                    std::ostringstream oss;
+                    oss << "--frame\r\n";
+                    oss << "Content-Type: image/jpeg\r\n\r\n";
+                    sink.write(oss.str().c_str(), oss.str().size());
+                    sink.write((const char*)vf.frame.data(), vf.frame.size());
+                    sink.write("\r\n", 2);
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            sink.done();
+        });
+    });
+
+    // graceful shutdown
+    svr.set_exception_handler([&](const auto& req, auto& res, std::exception &e) {
+        res.status = 500;
+        res.set_content(std::string("Internal error: ") + e.what(), "text/plain");
+    });
+
+    std::cout << "Starting HTTP server on " << http_host << ":" << http_port << std::endl;
+    svr.listen(http_host.c_str(), http_port);
+
+    // cleanup
+    running = false;
+    camctl.shutdown();
+    if (phase_thread.joinable()) phase_thread.join();
+
+    return 0;
 }
