@@ -1,175 +1,242 @@
-```javascript
-// DeviceShifu Driver for "Test device" using HTTP protocol
-// Requirements: Runs as an HTTP server, manages EdgeDevice CRD status, loads ConfigMap, proxies device APIs
+// DeviceShifu HTTP Driver for "Test device"
 // Language: JavaScript (Node.js)
+// Protocol: HTTP
 
 const express = require('express');
-const axios = require('axios');
-const fs = require('fs');
-const yaml = require('js-yaml');
 const k8s = require('@kubernetes/client-node');
+const fs = require('fs').promises;
 const path = require('path');
 
-// Environment variable validation
+// ENV config
 const {
     EDGEDEVICE_NAME,
     EDGEDEVICE_NAMESPACE,
-    DEVICE_HTTP_ADDRESS,
     SERVER_HOST = '0.0.0.0',
     SERVER_PORT = '8080'
 } = process.env;
 
-if (!EDGEDEVICE_NAME || !EDGEDEVICE_NAMESPACE || !DEVICE_HTTP_ADDRESS) {
-    console.error('Missing required environment variables: EDGEDEVICE_NAME, EDGEDEVICE_NAMESPACE, or DEVICE_HTTP_ADDRESS');
-    process.exit(1);
-}
+// Kubernetes CRD API group/version/kind
+const GROUP = 'shifu.edgenesis.io';
+const VERSION = 'v1alpha1';
+const PLURAL = 'edgedevices';
 
-// Load API settings from ConfigMap YAML
-const CONFIG_PATH = '/etc/edgedevice/config/instructions';
-let apiSettings = {};
-try {
-    if (fs.existsSync(CONFIG_PATH)) {
-        const fileContent = fs.readFileSync(CONFIG_PATH, 'utf8');
-        apiSettings = yaml.load(fileContent) || {};
-    }
-} catch (err) {
-    console.error('Error reading/parsing config instructions:', err);
-}
+const EDGEDEVICE_CONFIG_PATH = '/etc/edgedevice/config/instructions';
 
-// Kubernetes API client setup
-const kc = new k8s.KubeConfig();
-kc.loadFromCluster();
-const k8sApiCustomObjects = kc.makeApiClient(k8s.CustomObjectsApi);
-
-// CRD Info
-const CRD_GROUP = 'shifu.edgenesis.io';
-const CRD_VERSION = 'v1alpha1';
-const CRD_PLURAL = 'edgedevices';
-
-// Device Phase Enum
-const DevicePhase = {
-    Pending: 'Pending',
-    Running: 'Running',
-    Failed: 'Failed',
-    Unknown: 'Unknown'
+// Device status phases
+const PHASES = {
+    PENDING: 'Pending',
+    RUNNING: 'Running',
+    FAILED: 'Failed',
+    UNKNOWN: 'Unknown'
 };
 
-let currentPhase = DevicePhase.Unknown;
+let deviceAddress = null;
+let protocolSettings = {};
 
-// Helper: Update EdgeDevice Status
-async function updateEdgeDevicePhase(newPhase) {
-    if (currentPhase === newPhase) return;
-    currentPhase = newPhase;
+async function loadConfig() {
     try {
-        await k8sApiCustomObjects.patchNamespacedCustomObjectStatus(
-            CRD_GROUP,
-            CRD_VERSION,
-            EDGEDEVICE_NAMESPACE,
-            CRD_PLURAL,
-            EDGEDEVICE_NAME,
-            { status: { edgeDevicePhase: newPhase } },
-            undefined,
-            undefined,
-            undefined,
+        const files = await fs.readdir(EDGEDEVICE_CONFIG_PATH);
+        for (const file of files) {
+            const content = await fs.readFile(path.join(EDGEDEVICE_CONFIG_PATH, file), 'utf-8');
+            const yaml = require('js-yaml');
+            const parsed = yaml.load(content);
+            protocolSettings = { ...protocolSettings, ...parsed };
+        }
+    } catch (err) {
+        // Ignore missing config directory
+    }
+}
+
+async function getDeviceAddress(k8sApi) {
+    try {
+        const res = await k8sApi.getNamespacedCustomObject(
+            GROUP, VERSION, EDGEDEVICE_NAMESPACE, PLURAL, EDGEDEVICE_NAME
+        );
+        deviceAddress = res.body?.spec?.address || null;
+        return deviceAddress;
+    } catch (err) {
+        return null;
+    }
+}
+
+async function updateDevicePhase(k8sApi, phase) {
+    try {
+        const patch = [
             {
-                headers: { 'Content-Type': 'application/merge-patch+json' }
+                op: 'replace',
+                path: '/status/edgeDevicePhase',
+                value: phase
             }
+        ];
+        await k8sApi.patchNamespacedCustomObjectStatus(
+            GROUP,
+            VERSION,
+            EDGEDEVICE_NAMESPACE,
+            PLURAL,
+            EDGEDEVICE_NAME,
+            patch,
+            undefined,
+            undefined,
+            undefined,
+            { headers: { 'Content-Type': 'application/json-patch+json' } }
         );
     } catch (err) {
-        // Don't crash, just log
-        console.error('Failed to update EdgeDevice phase:', err.body || err);
-    }
-}
-
-// Helper: Simple connectivity check
-async function checkDeviceStatus() {
-    try {
-        // Try to GET /info from the device (as a health check)
-        const url = `${DEVICE_HTTP_ADDRESS.replace(/\/+$/, '')}/info`;
-        await axios.get(url, { timeout: 3000 });
-        await updateEdgeDevicePhase(DevicePhase.Running);
-    } catch (err) {
-        await updateEdgeDevicePhase(DevicePhase.Failed);
-    }
-}
-
-// Periodic status check
-setInterval(checkDeviceStatus, 8000);
-checkDeviceStatus();
-
-// Express server setup
-const app = express();
-app.use(express.json());
-
-function getApiSettings(api) {
-    return (apiSettings[api] && apiSettings[api].protocolPropertyList) ? apiSettings[api].protocolPropertyList : {};
-}
-
-// GET /info endpoint
-app.get('/info', async (req, res) => {
-    // Proxy GET /info to the device
-    try {
-        const deviceUrl = `${DEVICE_HTTP_ADDRESS.replace(/\/+$/, '')}/info`;
-        const params = req.query || {};
-        const deviceResp = await axios.get(deviceUrl, { params, responseType: 'json', timeout: 5000 });
-
-        // Optionally adjust response with settings if needed
-        const settings = getApiSettings('info');
-        // (For this device, settings are not used further, but available if needed)
-
-        res.status(deviceResp.status).json(deviceResp.data);
-        await updateEdgeDevicePhase(DevicePhase.Running);
-    } catch (err) {
-        await updateEdgeDevicePhase(DevicePhase.Failed);
-        if (err.response) {
-            res.status(err.response.status).send(err.response.data);
-        } else {
-            res.status(502).json({ error: 'Device not reachable', details: err.message });
+        // fallback: try add if not exist
+        try {
+            const patch = [
+                {
+                    op: 'add',
+                    path: '/status',
+                    value: { edgeDevicePhase: phase }
+                }
+            ];
+            await k8sApi.patchNamespacedCustomObjectStatus(
+                GROUP,
+                VERSION,
+                EDGEDEVICE_NAMESPACE,
+                PLURAL,
+                EDGEDEVICE_NAME,
+                patch,
+                undefined,
+                undefined,
+                undefined,
+                { headers: { 'Content-Type': 'application/json-patch+json' } }
+            );
+        } catch (e) {
+            // Give up if still fails
         }
     }
-});
+}
 
-// POST /msg endpoint
-app.post('/msg', async (req, res) => {
-    // Proxy POST /msg to the device
+async function checkDeviceConnection() {
+    if (!deviceAddress) return false;
     try {
-        const deviceUrl = `${DEVICE_HTTP_ADDRESS.replace(/\/+$/, '')}/msg`;
-        const settings = getApiSettings('msg');
-        // (For this device, settings are not used further, but available if needed)
-
-        const deviceResp = await axios.post(deviceUrl, req.body, {
-            headers: { 'Content-Type': 'application/json' },
-            timeout: 5000
-        });
-        res.status(deviceResp.status).json(deviceResp.data);
-        await updateEdgeDevicePhase(DevicePhase.Running);
+        const res = await fetch(`http://${deviceAddress}/info`, { method: 'GET', timeout: 2000 });
+        return res.ok;
     } catch (err) {
-        await updateEdgeDevicePhase(DevicePhase.Failed);
-        if (err.response) {
-            res.status(err.response.status).send(err.response.data);
-        } else {
-            res.status(502).json({ error: 'Device not reachable', details: err.message });
+        return false;
+    }
+}
+
+async function main() {
+    // K8s API config
+    const kc = new k8s.KubeConfig();
+    kc.loadFromCluster();
+    const k8sApi = kc.makeApiClient(k8s.CustomObjectsApi);
+
+    // Load API settings
+    await loadConfig();
+
+    // Get device address from CRD
+    deviceAddress = await getDeviceAddress(k8sApi);
+
+    // Device phase management
+    let currentPhase = PHASES.PENDING;
+    if (!deviceAddress) {
+        currentPhase = PHASES.PENDING;
+        await updateDevicePhase(k8sApi, currentPhase);
+    } else {
+        // Try connect to device
+        try {
+            const isConnected = await checkDeviceConnection();
+            currentPhase = isConnected ? PHASES.RUNNING : PHASES.FAILED;
+            await updateDevicePhase(k8sApi, currentPhase);
+        } catch {
+            currentPhase = PHASES.FAILED;
+            await updateDevicePhase(k8sApi, currentPhase);
         }
     }
-});
 
-// Root endpoint
-app.get('/', (req, res) => {
-    res.json({
-        message: 'DeviceShifu HTTP driver for Test device',
-        endpoints: [
-            { method: 'GET', path: '/info', description: 'Get device information' },
-            { method: 'POST', path: '/msg', description: 'Send command message to device' }
-        ]
+    // Periodically refresh device status
+    setInterval(async () => {
+        const addr = await getDeviceAddress(k8sApi);
+        if (!addr) {
+            if (currentPhase !== PHASES.PENDING) {
+                currentPhase = PHASES.PENDING;
+                await updateDevicePhase(k8sApi, currentPhase);
+            }
+            deviceAddress = null;
+            return;
+        }
+        if (addr !== deviceAddress) {
+            deviceAddress = addr;
+        }
+        try {
+            const isConnected = await checkDeviceConnection();
+            const newPhase = isConnected ? PHASES.RUNNING : PHASES.FAILED;
+            if (newPhase !== currentPhase) {
+                currentPhase = newPhase;
+                await updateDevicePhase(k8sApi, currentPhase);
+            }
+        } catch {
+            if (currentPhase !== PHASES.FAILED) {
+                currentPhase = PHASES.FAILED;
+                await updateDevicePhase(k8sApi, currentPhase);
+            }
+        }
+    }, 10000);
+
+    // HTTP Server
+    const app = express();
+    app.use(express.json());
+
+    // GET /info: proxy to device, stream JSON result
+    app.get('/info', async (req, res) => {
+        if (!deviceAddress) {
+            return res.status(503).json({ error: 'Device address not configured.' });
+        }
+        try {
+            // Pass query params
+            const url = new URL(`http://${deviceAddress}/info`);
+            Object.entries(req.query).forEach(([key, value]) => url.searchParams.append(key, value));
+            const fetchRes = await fetch(url, { method: 'GET', timeout: 5000 });
+            if (!fetchRes.ok) {
+                return res.status(fetchRes.status).json({ error: 'Device responded with error.' });
+            }
+            res.set('Content-Type', 'application/json');
+            fetchRes.body.pipe(res);
+        } catch (err) {
+            res.status(502).json({ error: 'Failed to fetch device info.' });
+        }
     });
-});
 
-// Start HTTP server
-app.listen(Number(SERVER_PORT), SERVER_HOST, () => {
-    console.log(`DeviceShifu HTTP driver listening on http://${SERVER_HOST}:${SERVER_PORT}`);
-});
+    // POST /msg: proxy JSON command to device
+    app.post('/msg', async (req, res) => {
+        if (!deviceAddress) {
+            return res.status(503).json({ error: 'Device address not configured.' });
+        }
+        try {
+            const settings = protocolSettings.msg?.protocolPropertyList || {};
+            const url = new URL(`http://${deviceAddress}/msg`);
+            Object.entries(settings).forEach(([key, value]) => url.searchParams.append(key, value));
+            const fetchRes = await fetch(url, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(req.body),
+                timeout: 5000
+            });
+            if (!fetchRes.ok) {
+                return res.status(fetchRes.status).json({ error: 'Device command failed.' });
+            }
+            res.set('Content-Type', 'application/json');
+            fetchRes.body.pipe(res);
+        } catch (err) {
+            res.status(502).json({ error: 'Failed to send message to device.' });
+        }
+    });
 
-// Graceful shutdown
-process.on('SIGTERM', () => process.exit(0));
-process.on('SIGINT', () => process.exit(0));
-```
+    // Health endpoint
+    app.get('/healthz', (_req, res) => {
+        res.json({ status: 'ok', phase: currentPhase });
+    });
+
+    app.listen(Number(SERVER_PORT), SERVER_HOST, () => {
+        // Server running
+    });
+}
+
+// Polyfill fetch for Node.js (since node-fetch v3 is ESM only, use undici)
+const { fetch } = require('undici');
+global.fetch = fetch;
+
+main().catch(() => process.exit(1));
