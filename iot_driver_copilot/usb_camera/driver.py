@@ -1,233 +1,248 @@
 import os
+import yaml
 import threading
 import time
-import yaml
+
+from flask import Flask, Response, jsonify, request, abort
 import cv2
-from flask import Flask, Response, send_file, jsonify, request
-from kubernetes import client, config as k8s_config
+import io
+
+from kubernetes import client, config
 from kubernetes.client.rest import ApiException
 
-# ========== Environment Variables ==========
-EDGEDEVICE_NAME = os.environ["EDGEDEVICE_NAME"]
-EDGEDEVICE_NAMESPACE = os.environ["EDGEDEVICE_NAMESPACE"]
-SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
-SERVER_PORT = int(os.environ.get("SERVER_PORT", "8080"))
-CAMERA_INDEX = int(os.environ.get("CAMERA_INDEX", "0"))
-INSTRUCTIONS_PATH = "/etc/edgedevice/config/instructions"
-EDGEDEVICE_CRD_GROUP = "shifu.edgenesis.io"
-EDGEDEVICE_CRD_VERSION = "v1alpha1"
-EDGEDEVICE_CRD_PLURAL = "edgedevices"
-EDGEDEVICE_CRD_KIND = "EdgeDevice"
+# ==== CONFIGURATION ====
 
-# ========== ConfigMap Parsing ==========
-def load_instruction_config():
-    config = {}
-    if os.path.exists(INSTRUCTIONS_PATH):
-        with open(INSTRUCTIONS_PATH, "r") as f:
-            config = yaml.safe_load(f) or {}
-    return config
+EDGEDEVICE_NAME = os.environ.get('EDGEDEVICE_NAME')
+EDGEDEVICE_NAMESPACE = os.environ.get('EDGEDEVICE_NAMESPACE')
+HTTP_SERVER_HOST = os.environ.get('HTTP_SERVER_HOST', '0.0.0.0')
+HTTP_SERVER_PORT = int(os.environ.get('HTTP_SERVER_PORT', '8080'))
+CAMERA_INDEX = int(os.environ.get('CAMERA_INDEX', '0'))
+INSTRUCTIONS_CONFIG_PATH = '/etc/edgedevice/config/instructions'
 
-instruction_config = load_instruction_config()
+if EDGEDEVICE_NAME is None or EDGEDEVICE_NAMESPACE is None:
+    raise RuntimeError("Both EDGEDEVICE_NAME and EDGEDEVICE_NAMESPACE environment variables must be set.")
 
-# ========== EdgeDevice CRD Client ==========
-def get_k8s_api():
+# ==== LOAD INSTRUCTIONS ====
+
+def load_api_instructions(config_path):
     try:
-        k8s_config.load_incluster_config()
+        with open(config_path, 'r') as f:
+            return yaml.safe_load(f) or {}
     except Exception:
-        k8s_config.load_kube_config()
-    return client.CustomObjectsApi()
+        return {}
 
-def get_edgedevice(api):
+api_instructions = load_api_instructions(INSTRUCTIONS_CONFIG_PATH)
+
+# ==== K8S CLIENT ====
+
+def k8s_initialize():
     try:
-        return api.get_namespaced_custom_object(
-            EDGEDEVICE_CRD_GROUP,
-            EDGEDEVICE_CRD_VERSION,
-            EDGEDEVICE_NAMESPACE,
-            EDGEDEVICE_CRD_PLURAL,
-            EDGEDEVICE_NAME
-        )
-    except ApiException:
-        return None
+        config.load_incluster_config()
+    except Exception as e:
+        raise RuntimeError(f"Kubernetes in-cluster config failed: {e}")
 
-def update_edgedevice_status(api, phase):
-    for i in range(3):
+k8s_initialize()
+custom_api = client.CustomObjectsApi()
+
+EDGEDEVICE_GROUP = "shifu.edgenesis.io"
+EDGEDEVICE_VERSION = "v1alpha1"
+EDGEDEVICE_PLURAL = "edgedevices"
+
+def update_edge_device_phase(phase):
+    body = {
+        "status": {
+            "edgeDevicePhase": phase
+        }
+    }
+    for _ in range(3):
         try:
-            body = {
-                "status": {
-                    "edgeDevicePhase": phase
-                }
-            }
-            api.patch_namespaced_custom_object_status(
-                EDGEDEVICE_CRD_GROUP,
-                EDGEDEVICE_CRD_VERSION,
-                EDGEDEVICE_NAMESPACE,
-                EDGEDEVICE_CRD_PLURAL,
-                EDGEDEVICE_NAME,
-                body
+            custom_api.patch_namespaced_custom_object_status(
+                group=EDGEDEVICE_GROUP,
+                version=EDGEDEVICE_VERSION,
+                namespace=EDGEDEVICE_NAMESPACE,
+                plural=EDGEDEVICE_PLURAL,
+                name=EDGEDEVICE_NAME,
+                body=body
             )
             return
-        except ApiException:
+        except ApiException as e:
             time.sleep(1)
+    # Don't crash on failure, just log
+    print(f"Failed to update EdgeDevice phase to {phase}")
 
-def get_edgedevice_address(api):
-    ed = get_edgedevice(api)
-    if ed and 'spec' in ed and 'address' in ed['spec']:
-        return ed['spec']['address']
-    return None
+def get_device_address():
+    try:
+        obj = custom_api.get_namespaced_custom_object(
+            group=EDGEDEVICE_GROUP,
+            version=EDGEDEVICE_VERSION,
+            namespace=EDGEDEVICE_NAMESPACE,
+            plural=EDGEDEVICE_PLURAL,
+            name=EDGEDEVICE_NAME
+        )
+        return obj.get('spec', {}).get('address', None)
+    except Exception as e:
+        print(f"Could not get device address from EdgeDevice CRD: {e}")
+        return None
 
-# ========== Camera Handler ==========
-class USBCamera:
+# ==== CAMERA LOGIC ====
+
+class CameraStreamer:
     def __init__(self, camera_index):
         self.camera_index = camera_index
-        self.video_capture = None
-        self.streaming = False
+        self.cap = None
         self.lock = threading.Lock()
+        self.streaming = False
+        self.latest_frame = None
+        self.frame_thread = None
+        self.stop_request = threading.Event()
 
-    def connect(self):
+    def open(self):
         with self.lock:
-            if self.video_capture is not None:
-                self.video_capture.release()
-            self.video_capture = cv2.VideoCapture(self.camera_index)
-            if not self.video_capture.isOpened():
-                self.video_capture = None
-                return False
+            if self.cap is None or not self.cap.isOpened():
+                self.cap = cv2.VideoCapture(self.camera_index)
+                if not self.cap.isOpened():
+                    self.cap = None
+                    return False
             return True
 
-    def disconnect(self):
+    def close(self):
         with self.lock:
-            if self.video_capture is not None:
-                self.video_capture.release()
-                self.video_capture = None
-
-    def is_connected(self):
-        with self.lock:
-            return self.video_capture is not None and self.video_capture.isOpened()
-
-    def capture_image(self):
-        with self.lock:
-            if not self.is_connected():
-                if not self.connect():
-                    return None
-            ret, frame = self.video_capture.read()
-            if not ret:
-                return None
-            _, jpeg = cv2.imencode('.jpg', frame)
-            return jpeg.tobytes()
-
-    def frames(self):
-        while self.streaming:
-            with self.lock:
-                if not self.is_connected():
-                    if not self.connect():
-                        yield None
-                        continue
-                ret, frame = self.video_capture.read()
-                if not ret:
-                    yield None
-                    continue
-                _, jpeg = cv2.imencode('.jpg', frame)
-                frame_bytes = jpeg.tobytes()
-            yield frame_bytes
+            if self.cap is not None:
+                self.cap.release()
+                self.cap = None
 
     def start_stream(self):
         with self.lock:
-            if not self.is_connected():
-                if not self.connect():
-                    return False
+            if self.streaming:
+                return True
+            if not self.open():
+                return False
             self.streaming = True
-        return True
+            self.stop_request.clear()
+            self.frame_thread = threading.Thread(target=self._grab_frames, daemon=True)
+            self.frame_thread.start()
+            return True
 
     def stop_stream(self):
         with self.lock:
             self.streaming = False
-        return True
+            self.stop_request.set()
+        if self.frame_thread:
+            self.frame_thread.join(timeout=2)
+        self.close()
 
-# ========== Device Phase Monitor ==========
-class DevicePhaseMonitor(threading.Thread):
-    def __init__(self, camera: USBCamera, k8s_api):
-        super().__init__(daemon=True)
-        self.camera = camera
-        self.k8s_api = k8s_api
-        self.prev_phase = None
+    def _grab_frames(self):
+        while not self.stop_request.is_set():
+            ret, frame = False, None
+            with self.lock:
+                if self.cap:
+                    ret, frame = self.cap.read()
+            if ret:
+                with self.lock:
+                    self.latest_frame = frame
+            time.sleep(0.03)  # ~30 FPS
 
-    def run(self):
+    def get_latest_jpeg(self):
+        with self.lock:
+            if self.latest_frame is None:
+                return None
+            ret, jpeg = cv2.imencode('.jpg', self.latest_frame)
+            if not ret:
+                return None
+            return jpeg.tobytes()
+
+    def mjpeg_generator(self):
         while True:
-            try:
-                if self.camera.is_connected():
-                    phase = "Running" if self.camera.streaming else "Pending"
-                else:
-                    phase = "Failed"
-            except Exception:
-                phase = "Unknown"
-            if phase != self.prev_phase:
-                update_edgedevice_status(self.k8s_api, phase)
-                self.prev_phase = phase
-            time.sleep(3)
+            if not self.streaming:
+                break
+            frame = self.get_latest_jpeg()
+            if frame is not None:
+                yield (
+                    b'--frame\r\n'
+                    b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n'
+                )
+            else:
+                time.sleep(0.05)
 
-# ========== Flask App ==========
+    def capture_image(self):
+        with self.lock:
+            if not self.open():
+                return None
+            ret, frame = self.cap.read()
+            if not ret:
+                return None
+            ret, jpeg = cv2.imencode('.jpg', frame)
+            if not ret:
+                return None
+            return jpeg.tobytes()
+
+# ==== DEVICE STATUS THREAD ====
+
+def device_status_loop(camera_streamer):
+    last_status = None
+    while True:
+        try:
+            if camera_streamer.open():
+                cur_status = "Running" if camera_streamer.cap and camera_streamer.cap.isOpened() else "Pending"
+            else:
+                cur_status = "Failed"
+        except Exception:
+            cur_status = "Unknown"
+        if cur_status != last_status:
+            update_edge_device_phase(cur_status)
+            last_status = cur_status
+        time.sleep(5)
+
+# ==== FLASK APP ====
+
 app = Flask(__name__)
-camera = USBCamera(CAMERA_INDEX)
-k8s_api = get_k8s_api()
-device_phase_monitor = DevicePhaseMonitor(camera, k8s_api)
-device_phase_monitor.start()
+camera = CameraStreamer(CAMERA_INDEX)
+device_address = get_device_address()
 
-# ========== API Endpoints ==========
+# --- HTTP ENDPOINTS ---
 
-@app.route("/stream/start", methods=["POST"])
+@app.route("/stream/start", methods=['POST'])
 def start_stream():
-    settings = instruction_config.get("stream/start", {}).get("protocolPropertyList", {})
-    res = camera.start_stream()
-    if res:
-        return jsonify({"status": "streaming started"}), 200
+    settings = api_instructions.get('stream_start', {}).get('protocolPropertyList', {})
+    if camera.start_stream():
+        update_edge_device_phase("Running")
+        return jsonify({"status": "success", "message": "Stream started."}), 200
     else:
-        update_edgedevice_status(k8s_api, "Failed")
-        return jsonify({"error": "Failed to start stream"}), 500
+        update_edge_device_phase("Failed")
+        return jsonify({"status": "failure", "message": "Failed to start camera stream."}), 500
 
-@app.route("/stream/stop", methods=["POST"])
+@app.route("/stream/stop", methods=['POST'])
 def stop_stream():
-    settings = instruction_config.get("stream/stop", {}).get("protocolPropertyList", {})
-    res = camera.stop_stream()
-    camera.disconnect()
-    if res:
-        return jsonify({"status": "stream stopped"}), 200
-    else:
-        return jsonify({"error": "Failed to stop stream"}), 500
+    settings = api_instructions.get('stream_stop', {}).get('protocolPropertyList', {})
+    camera.stop_stream()
+    update_edge_device_phase("Pending")
+    return jsonify({"status": "success", "message": "Stream stopped."})
 
-@app.route("/stream", methods=["GET"])
+@app.route("/stream", methods=['GET'])
 def stream():
-    settings = instruction_config.get("stream", {}).get("protocolPropertyList", {})
+    settings = api_instructions.get('stream', {}).get('protocolPropertyList', {})
     if not camera.streaming:
-        return jsonify({"error": "Stream not started"}), 400
+        abort(503, "Stream not started. Please POST to /stream/start first.")
+    return Response(camera.mjpeg_generator(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
-    def generate():
-        for frame in camera.frames():
-            if frame is None or not camera.streaming:
-                continue
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
-    return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
-
-@app.route("/image/capture", methods=["POST"])
+@app.route("/image/capture", methods=['POST'])
 def capture_image():
-    settings = instruction_config.get("image/capture", {}).get("protocolPropertyList", {})
-    image_bytes = camera.capture_image()
-    if image_bytes is None:
-        update_edgedevice_status(k8s_api, "Failed")
-        return jsonify({"error": "Failed to capture image"}), 500
-    return Response(image_bytes, mimetype='image/jpeg')
+    settings = api_instructions.get('image_capture', {}).get('protocolPropertyList', {})
+    img_bytes = camera.capture_image()
+    if img_bytes is None:
+        update_edge_device_phase("Failed")
+        return jsonify({"status": "failure", "message": "Failed to capture image."}), 500
+    update_edge_device_phase("Running")
+    return Response(img_bytes, mimetype='image/jpeg')
 
-@app.route("/healthz", methods=["GET"])
+@app.route("/healthz", methods=['GET'])
 def healthz():
-    return "OK", 200
+    return "ok"
 
-# ========== Main ==========
+# ==== MAIN ====
+
 if __name__ == "__main__":
-    update_edgedevice_status(k8s_api, "Pending")
-    try:
-        if camera.connect():
-            update_edgedevice_status(k8s_api, "Running")
-        else:
-            update_edgedevice_status(k8s_api, "Failed")
-    except Exception:
-        update_edgedevice_status(k8s_api, "Unknown")
-    app.run(host=SERVER_HOST, port=SERVER_PORT, threaded=True)
+    status_thread = threading.Thread(target=device_status_loop, args=(camera,), daemon=True)
+    status_thread.start()
+    update_edge_device_phase("Pending")
+    app.run(host=HTTP_SERVER_HOST, port=HTTP_SERVER_PORT, threaded=True)
