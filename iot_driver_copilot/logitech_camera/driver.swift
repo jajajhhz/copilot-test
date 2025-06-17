@@ -1,199 +1,208 @@
+//
+//  LogitechCameraHTTPDriver.swift
+//
+//  Swift HTTP server for USB Camera control (Logitech, Mac/Win/Linux)
+//  Core endpoints: list, select, start, stop, stream, capture, record
+//  Uses only Foundation, Dispatch, and AVFoundation (Apple standard SDKs)
+//
+//  Env vars: HTTP_HOST, HTTP_PORT, CAMERA_RES_WIDTH, CAMERA_RES_HEIGHT, CAMERA_FPS
+//
+
 import Foundation
-import Vapor
 import AVFoundation
 
-// MARK: - Configuration via Environment Variables
+#if os(Linux)
+#error("This driver currently requires macOS (AVFoundation).")
+#endif
 
-let SERVER_HOST = Environment.get("SERVER_HOST") ?? "0.0.0.0"
-let SERVER_PORT = Int(Environment.get("SERVER_PORT") ?? "8080") ?? 8080
-let DEFAULT_RES_WIDTH = Int(Environment.get("CAMERA_RES_WIDTH") ?? "640") ?? 640
-let DEFAULT_RES_HEIGHT = Int(Environment.get("CAMERA_RES_HEIGHT") ?? "480") ?? 480
-let DEFAULT_FPS = Int(Environment.get("CAMERA_FPS") ?? "20") ?? 20
+// MARK: - Config
+struct Config {
+    static let host = ProcessInfo.processInfo.environment["HTTP_HOST"] ?? "0.0.0.0"
+    static let port = UInt16(ProcessInfo.processInfo.environment["HTTP_PORT"] ?? "8080") ?? 8080
+    static let width = Int(ProcessInfo.processInfo.environment["CAMERA_RES_WIDTH"] ?? "640") ?? 640
+    static let height = Int(ProcessInfo.processInfo.environment["CAMERA_RES_HEIGHT"] ?? "480") ?? 480
+    static let fps = Int(ProcessInfo.processInfo.environment["CAMERA_FPS"] ?? "15") ?? 15
+}
 
-// MARK: - Camera Session Management
+// MARK: - Camera Management
 
-final class CameraManager {
+final class CameraManager: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     static let shared = CameraManager()
-    
-    private var captureSession: AVCaptureSession?
+    private override init() {}
+
+    private var session: AVCaptureSession?
     private var videoOutput: AVCaptureVideoDataOutput?
-    private var photoOutput: AVCapturePhotoOutput?
-    private var videoConnection: AVCaptureConnection?
-    private var cameraInput: AVCaptureDeviceInput?
-    private var currentCamera: AVCaptureDevice?
-    private var isStreaming = false
-    private var lock = NSLock()
-    
-    private var availableCameras: [AVCaptureDevice] {
-        let discovery = AVCaptureDevice.DiscoverySession(deviceTypes: [.externalUnknown, .builtInWideAngleCamera], mediaType: .video, position: .unspecified)
-        return discovery.devices
-    }
-    
-    private var outputFormat: OSType {
-        return kCVPixelFormatType_32BGRA
-    }
-    
-    // For MJPEG streaming
-    private var streamClients: [ObjectIdentifier: Response.Body.StreamWriter] = [:]
-    
-    private init() { }
-    
+    private var deviceInput: AVCaptureDeviceInput?
+    private(set) var activeCameraId: String?
+    private var frameBuffer: CGImage?
+    private let frameLock = NSLock()
+    private var streamingClients = NSHashTable<StreamingClient>.weakObjects()
+
+    // For recording lock
+    private let recordLock = NSLock()
+    private var isRecording = false
+
     func listCameras() -> [[String: Any]] {
-        var result: [[String: Any]] = []
-        for cam in availableCameras {
-            result.append([
-                "camera_id": cam.uniqueID,
-                "localized_name": cam.localizedName,
-                "is_active": currentCamera?.uniqueID == cam.uniqueID
-            ])
+        let devices = AVCaptureDevice.devices(for: .video)
+        return devices.map {
+            [
+                "camera_id": $0.uniqueID,
+                "localized_name": $0.localizedName,
+                "connected": true,
+                "model_id": $0.modelID ?? "",
+                "manufacturer": $0.manufacturer ?? ""
+            ]
         }
-        return result
     }
-    
-    func startCamera(cameraID: String? = nil, width: Int = DEFAULT_RES_WIDTH, height: Int = DEFAULT_RES_HEIGHT, fps: Int = DEFAULT_FPS) throws {
-        lock.lock()
-        defer { lock.unlock() }
-        if captureSession?.isRunning == true {
-            return // Already started
+
+    func selectCamera(by id: String) throws {
+        try stopCamera()
+        guard let device = AVCaptureDevice.devices(for: .video).first(where: { $0.uniqueID == id }) else {
+            throw NSError(domain: "CameraError", code: 404, userInfo: [NSLocalizedDescriptionKey: "Camera not found"])
         }
-        let camera: AVCaptureDevice
-        if let camID = cameraID {
-            guard let cam = availableCameras.first(where: { $0.uniqueID == camID }) else {
-                throw Abort(.notFound, reason: "Camera with id \(camID) not found.")
-            }
-            camera = cam
-        } else {
-            guard let cam = availableCameras.first else {
-                throw Abort(.notFound, reason: "No camera available.")
-            }
-            camera = cam
+        try activateCamera(device: device)
+    }
+
+    func startDefaultCamera() throws {
+        if session != nil { throw NSError(domain: "CameraError", code: 409, userInfo: [NSLocalizedDescriptionKey: "Camera already started"]) }
+        guard let device = AVCaptureDevice.devices(for: .video).first else {
+            throw NSError(domain: "CameraError", code: 404, userInfo: [NSLocalizedDescriptionKey: "No camera found"])
         }
+        try activateCamera(device: device)
+    }
+
+    private func activateCamera(device: AVCaptureDevice) throws {
         let session = AVCaptureSession()
-        session.beginConfiguration()
         session.sessionPreset = .vga640x480
-        if session.canSetSessionPreset(.high) && width > 640 && height > 480 {
-            session.sessionPreset = .high
-        }
-        let input = try AVCaptureDeviceInput(device: camera)
-        if session.canAddInput(input) {
-            session.addInput(input)
-        } else {
-            throw Abort(.internalServerError, reason: "Could not add camera input.")
-        }
-        // Video output for streaming
+
+        let input = try AVCaptureDeviceInput(device: device)
+        if session.canAddInput(input) { session.addInput(input) }
         let videoOutput = AVCaptureVideoDataOutput()
         videoOutput.videoSettings = [
-            kCVPixelBufferPixelFormatTypeKey as String: outputFormat
+            (kCVPixelBufferPixelFormatTypeKey as String): kCVPixelFormatType_32BGRA
         ]
-        videoOutput.alwaysDiscardsLateVideoFrames = true
-        if session.canAddOutput(videoOutput) {
-            session.addOutput(videoOutput)
-        } else {
-            throw Abort(.internalServerError, reason: "Could not add video output.")
+        videoOutput.setSampleBufferDelegate(self, queue: DispatchQueue(label: "VideoFrameQueue"))
+        if session.canAddOutput(videoOutput) { session.addOutput(videoOutput) }
+        // Set resolution
+        try device.lockForConfiguration()
+        if device.activeFormat.isVideoStabilizationModeSupported(.off) {
+            device.activeVideoMinFrameDuration = CMTime(value: 1, timescale: CMTimeScale(Config.fps))
+            device.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: CMTimeScale(Config.fps))
         }
-        // Photo output for capture
-        let photoOutput = AVCapturePhotoOutput()
-        if session.canAddOutput(photoOutput) {
-            session.addOutput(photoOutput)
+        if device.activeFormat.formatDescription.dimensions.width != Config.width ||
+            device.activeFormat.formatDescription.dimensions.height != Config.height {
+            // Try to select best format for resolution
+            let format = device.formats.first(where: {
+                let desc = $0.formatDescription
+                let dims = CMVideoFormatDescriptionGetDimensions(desc)
+                return Int(dims.width) == Config.width && Int(dims.height) == Config.height
+            }) ?? device.activeFormat
+            device.activeFormat = format
         }
-        // Set frame rate
-        try camera.lockForConfiguration()
-        camera.activeVideoMinFrameDuration = CMTime(value: 1, timescale: CMTimeScale(fps))
-        camera.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: CMTimeScale(fps))
-        camera.unlockForConfiguration()
-        session.commitConfiguration()
-        self.captureSession = session
-        self.cameraInput = input
-        self.currentCamera = camera
+        device.unlockForConfiguration()
+
+        self.session = session
+        self.deviceInput = input
         self.videoOutput = videoOutput
-        self.photoOutput = photoOutput
-        self.isStreaming = false
+        self.activeCameraId = device.uniqueID
         session.startRunning()
     }
-    
-    func stopCamera() {
-        lock.lock()
-        defer { lock.unlock() }
-        captureSession?.stopRunning()
-        isStreaming = false
-        captureSession = nil
-        videoOutput = nil
-        photoOutput = nil
-        cameraInput = nil
-        currentCamera = nil
-        streamClients.removeAll()
+
+    func stopCamera() throws {
+        guard let session = self.session else { return }
+        session.stopRunning()
+        self.session = nil
+        self.deviceInput = nil
+        self.videoOutput = nil
+        self.activeCameraId = nil
+        clearFrame()
     }
-    
-    func switchCamera(cameraID: String) throws {
-        lock.lock()
-        defer { lock.unlock() }
-        stopCamera()
-        try startCamera(cameraID: cameraID)
+
+    func isCameraActive() -> Bool {
+        return session?.isRunning == true
     }
-    
-    func captureFrame(format: String = "jpeg", width: Int = DEFAULT_RES_WIDTH, height: Int = DEFAULT_RES_HEIGHT, eventLoop: EventLoop) -> EventLoopFuture<(Data, [String: Any])> {
-        guard let session = captureSession, session.isRunning else {
-            return eventLoop.makeFailedFuture(Abort(.serviceUnavailable, reason: "Camera is not running."))
+
+    private func clearFrame() {
+        frameLock.lock()
+        defer { frameLock.unlock() }
+        self.frameBuffer = nil
+    }
+
+    func captureFrame() throws -> (Data, [String: Any]) {
+        guard isCameraActive() else {
+            throw NSError(domain: "CameraError", code: 400, userInfo: [NSLocalizedDescriptionKey: "Camera not running"])
         }
-        guard let photoOutput = self.photoOutput else {
-            return eventLoop.makeFailedFuture(Abort(.internalServerError, reason: "Photo output unavailable."))
+        var image: CGImage?
+        let timeout = DispatchTime.now() + .seconds(2)
+        while image == nil && DispatchTime.now() < timeout {
+            frameLock.lock()
+            image = self.frameBuffer
+            frameLock.unlock()
+            if image == nil { usleep(10000) }
         }
-        let promise = eventLoop.makePromise(of: (Data, [String: Any]).self)
-        let settings = AVCapturePhotoSettings(format: [AVVideoCodecKey: AVVideoCodecType.jpeg])
-        photoOutput.capturePhoto(with: settings, delegate: PhotoCaptureDelegate { imageData, error in
-            if let error = error {
-                promise.fail(error)
-                return
+        guard let cgImg = image else {
+            throw NSError(domain: "CameraError", code: 504, userInfo: [NSLocalizedDescriptionKey: "Timeout waiting for frame"])
+        }
+        let bitmapRep = NSBitmapImageRep(cgImage: cgImg)
+        guard let imgData = bitmapRep.representation(using: .jpeg, properties: [:]) else {
+            throw NSError(domain: "CameraError", code: 500, userInfo: [NSLocalizedDescriptionKey: "Failed to encode image"])
+        }
+        let meta: [String: Any] = [
+            "width": cgImg.width,
+            "height": cgImg.height,
+            "timestamp": Int(Date().timeIntervalSince1970)
+        ]
+        return (imgData, meta)
+    }
+
+    // MARK: - VideoDataOutput Delegate
+    func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        guard let buf = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        let ciImage = CIImage(cvPixelBuffer: buf)
+        let context = CIContext(options: nil)
+        if let cgImg = context.createCGImage(ciImage, from: ciImage.extent) {
+            frameLock.lock()
+            self.frameBuffer = cgImg
+            frameLock.unlock()
+            let clients = streamingClients.allObjects
+            for client in clients {
+                client.pushFrame(cgImg: cgImg)
             }
-            guard let data = imageData else {
-                promise.fail(Abort(.internalServerError, reason: "Failed to capture image"))
-                return
-            }
-            let meta: [String: Any] = [
-                "format": "jpeg",
-                "timestamp": Date().iso8601,
-                "camera_id": self.currentCamera?.uniqueID ?? "unknown",
-                "resolution": ["width": width, "height": height]
-            ]
-            promise.succeed((data, meta))
-        })
-        return promise.futureResult
-    }
-    
-    func streamMJPEG(onFrame: @escaping (Data) -> Void) throws {
-        guard let session = captureSession, session.isRunning else {
-            throw Abort(.serviceUnavailable, reason: "Camera is not running.")
         }
-        guard let videoOutput = self.videoOutput else {
-            throw Abort(.internalServerError, reason: "Video output unavailable.")
-        }
-        if isStreaming { return }
-        isStreaming = true
-        videoOutput.setSampleBufferDelegate(MJPEGSampleBufferDelegate(onFrame: onFrame), queue: DispatchQueue.global(qos: .userInitiated))
     }
-    
-    func stopStreaming() {
-        isStreaming = false
-        videoOutput?.setSampleBufferDelegate(nil, queue: nil)
+
+    // MARK: - Streaming
+    func addStreamingClient(_ client: StreamingClient) {
+        streamingClients.add(client)
     }
-    
-    func recordVideo(duration: Int, format: String = "mp4", width: Int = DEFAULT_RES_WIDTH, height: Int = DEFAULT_RES_HEIGHT, fps: Int = DEFAULT_FPS, eventLoop: EventLoop) -> EventLoopFuture<(URL, Int)> {
-        let promise = eventLoop.makePromise(of: (URL, Int).self)
-        // Use a background temp file for video writing
-        let tmpDir = URL(fileURLWithPath: NSTemporaryDirectory())
-        let filename = "recording_\(UUID().uuidString).\(format)"
-        let fileURL = tmpDir.appendingPathComponent(filename)
-        
-        guard let session = captureSession, session.isRunning else {
-            promise.fail(Abort(.serviceUnavailable, reason: "Camera is not running."))
-            return promise.futureResult
+    func removeStreamingClient(_ client: StreamingClient) {
+        streamingClients.remove(client)
+    }
+
+    // MARK: - Recording
+    func recordVideo(duration: Int, to url: URL, completion: @escaping (Bool, String?) -> Void) {
+        recordLock.lock()
+        defer { recordLock.unlock() }
+        guard isCameraActive() else {
+            completion(false, "Camera not running")
+            return
         }
+        if isRecording {
+            completion(false, "Recording already in progress")
+            return
+        }
+        isRecording = true
+        let width = Config.width
+        let height = Config.height
+        let fps = Config.fps
         let writer: AVAssetWriter
         do {
-            writer = try AVAssetWriter(outputURL: fileURL, fileType: format == "avi" ? .avi : .mp4)
+            try? FileManager.default.removeItem(at: url)
+            writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
         } catch {
-            promise.fail(Abort(.internalServerError, reason: "Failed to create video file writer: \(error.localizedDescription)"))
-            return promise.futureResult
+            isRecording = false
+            completion(false, "Failed to create writer: \(error)")
+            return
         }
         let videoSettings: [String: Any] = [
             AVVideoCodecKey: AVVideoCodecType.h264,
@@ -202,249 +211,408 @@ final class CameraManager {
         ]
         let input = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
         input.expectsMediaDataInRealTime = true
-        if writer.canAdd(input) {
-            writer.add(input)
+        guard writer.canAdd(input) else {
+            isRecording = false
+            completion(false, "Writer can't add input")
+            return
         }
-        let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input, sourcePixelBufferAttributes: nil)
+        writer.add(input)
         writer.startWriting()
         writer.startSession(atSourceTime: .zero)
-        
-        let endTime = Date().addingTimeInterval(TimeInterval(duration))
-        var frameCount = 0
-        let frameDuration = CMTime(value: 1, timescale: CMTimeScale(fps))
-        
-        let queue = DispatchQueue(label: "video.recording.queue")
-        videoOutput?.setSampleBufferDelegate(VideoRecordingSampleBufferDelegate(input: input, adaptor: adaptor, writer: writer, until: endTime, frameDuration: frameDuration, onFinish: { writtenFrames, error in
-            if let error = error {
-                promise.fail(Abort(.internalServerError, reason: "Recording error: \(error.localizedDescription)"))
-                return
+
+        let queue = DispatchQueue(label: "RecordingQueue")
+        let group = DispatchGroup()
+        group.enter()
+        var isStopped = false
+        var startTime: CMTime?
+        self.frameLock.lock()
+        var lastFrame: CGImage? = self.frameBuffer
+        self.frameLock.unlock()
+
+        input.requestMediaDataWhenReady(on: queue) {
+            var frameCount = 0
+            let frameDuration = CMTime(value: 1, timescale: CMTimeScale(fps))
+            while !isStopped && input.isReadyForMoreMediaData && frameCount < duration * fps {
+                self.frameLock.lock()
+                guard let cgImg = self.frameBuffer ?? lastFrame else {
+                    self.frameLock.unlock()
+                    usleep(10000)
+                    continue
+                }
+                lastFrame = cgImg
+                self.frameLock.unlock()
+                guard let sampleBuffer = cgImageToSampleBuffer(cgImg, width: width, height: height, time: CMTimeMultiply(frameDuration, multiplier: Int32(frameCount))) else {
+                    usleep(10000)
+                    continue
+                }
+                if startTime == nil {
+                    startTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+                }
+                input.append(sampleBuffer)
+                frameCount += 1
+                Thread.sleep(forTimeInterval: 1.0/Double(fps))
             }
-            promise.succeed((fileURL, writtenFrames))
-        }), queue: queue)
-        
-        return promise.futureResult
-    }
-}
-
-// MARK: - MJPEG Sample Buffer Delegate
-
-final class MJPEGSampleBufferDelegate: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
-    let onFrame: (Data) -> Void
-    
-    init(onFrame: @escaping (Data) -> Void) {
-        self.onFrame = onFrame
-    }
-    
-    func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
-        guard let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-        let ciImage = CIImage(cvPixelBuffer: imageBuffer)
-        let context = CIContext()
-        guard let jpegData = context.jpegRepresentation(of: ciImage, colorSpace: CGColorSpaceCreateDeviceRGB(), options: [:]) else { return }
-        onFrame(jpegData)
-    }
-}
-
-// MARK: - Photo Capture Delegate
-
-final class PhotoCaptureDelegate: NSObject, AVCapturePhotoCaptureDelegate {
-    let onCapture: (Data?, Error?) -> Void
-    
-    init(onCapture: @escaping (Data?, Error?) -> Void) {
-        self.onCapture = onCapture
-    }
-    
-    func photoOutput(_ output: AVCapturePhotoOutput, didFinishProcessingPhoto photo: AVCapturePhoto, error: Error?) {
-        onCapture(photo.fileDataRepresentation(), error)
-    }
-}
-
-// MARK: - Video Recording Sample Buffer Delegate
-
-final class VideoRecordingSampleBufferDelegate: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
-    let input: AVAssetWriterInput
-    let adaptor: AVAssetWriterInputPixelBufferAdaptor
-    let writer: AVAssetWriter
-    let until: Date
-    let frameDuration: CMTime
-    let onFinish: (Int, Error?) -> Void
-    var frameCount = 0
-    var isRecording = true
-    
-    init(input: AVAssetWriterInput, adaptor: AVAssetWriterInputPixelBufferAdaptor, writer: AVAssetWriter, until: Date, frameDuration: CMTime, onFinish: @escaping (Int, Error?) -> Void) {
-        self.input = input
-        self.adaptor = adaptor
-        self.writer = writer
-        self.until = until
-        self.frameDuration = frameDuration
-        self.onFinish = onFinish
-        super.init()
-        DispatchQueue.global().asyncAfter(deadline: .now() + until.timeIntervalSinceNow) { [weak self] in
-            self?.finish()
+            input.markAsFinished()
+            writer.finishWriting {
+                isStopped = true
+                self.isRecording = false
+                group.leave()
+            }
         }
-    }
-    
-    func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
-        guard isRecording else { return }
-        if Date() >= until {
-            finish()
-            return
+        DispatchQueue.global().asyncAfter(deadline: .now() + .seconds(duration)) {
+            isStopped = true
         }
-        guard input.isReadyForMoreMediaData else { return }
-        guard let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-        let time = CMTimeMultiply(frameDuration, multiplier: Int32(frameCount))
-        if !adaptor.append(imageBuffer, withPresentationTime: time) {
-            finish(error: NSError(domain: "VideoRecording", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to append frame"]))
-            return
-        }
-        frameCount += 1
-    }
-    
-    func finish(error: Error? = nil) {
-        guard isRecording else { return }
-        isRecording = false
-        input.markAsFinished()
-        writer.finishWriting {
-            self.onFinish(self.frameCount, error)
+        group.notify(queue: .main) {
+            completion(true, nil)
         }
     }
 }
 
-// MARK: - Date ISO8601 Extension
+class StreamingClient: NSObject {
+    private let output: OutputStream
+    private let boundary = "CAMERA_MJPEG_BOUNDARY"
+    private var isRunning = true
+    private let lock = NSLock()
+    init(output: OutputStream) {
+        self.output = output
+    }
 
-extension Date {
-    var iso8601: String {
-        let formatter = ISO8601DateFormatter()
-        return formatter.string(from: self)
+    func start() {
+        let header = """
+        HTTP/1.1 200 OK\r
+        Content-Type: multipart/x-mixed-replace; boundary=\(boundary)\r
+        Cache-Control: no-cache\r
+        Connection: close\r
+        \r
+        """
+        write(header)
+    }
+
+    func pushFrame(cgImg: CGImage) {
+        guard isRunning else { return }
+        let bitmapRep = NSBitmapImageRep(cgImage: cgImg)
+        guard let imgData = bitmapRep.representation(using: .jpeg, properties: [:]) else { return }
+        let part = """
+        --\(boundary)\r
+        Content-Type: image/jpeg\r
+        Content-Length: \(imgData.count)\r
+        \r
+        """
+        lock.lock()
+        write(part)
+        _ = imgData.withUnsafeBytes { output.write($0.bindMemory(to: UInt8.self).baseAddress!, maxLength: imgData.count) }
+        write("\r\n")
+        lock.unlock()
+    }
+
+    func stop() {
+        isRunning = false
+        write("\r\n--\(boundary)--\r\n")
+        output.close()
+    }
+
+    private func write(_ str: String) {
+        guard let data = str.data(using: .utf8) else { return }
+        _ = data.withUnsafeBytes { output.write($0.bindMemory(to: UInt8.self).baseAddress!, maxLength: data.count) }
     }
 }
 
-// MARK: - Main HTTP Server
+// MARK: - HTTP Server
 
-func routes(_ app: Application) throws {
-    // List all cameras
-    app.get("cameras") { req -> Response in
-        let cams = CameraManager.shared.listCameras()
-        let res = Response(status: .ok)
-        try res.content.encode(cams)
-        return res
+final class HTTPServer {
+    private let listener: FileHandle
+    private let queue = DispatchQueue(label: "HTTPServerQueue")
+    private var shouldRun = true
+
+    init(host: String, port: UInt16) throws {
+        let sockfd = socket(AF_INET, SOCK_STREAM, 0)
+        guard sockfd >= 0 else { throw NSError(domain: "HTTPServer", code: 500, userInfo: [NSLocalizedDescriptionKey: "Socket error"]) }
+        var addr = sockaddr_in(
+            sin_len: UInt8(MemoryLayout<sockaddr_in>.stride),
+            sin_family: sa_family_t(AF_INET),
+            sin_port: CFSwapInt16HostToBig(port),
+            sin_addr: in_addr(s_addr: inet_addr(host)),
+            sin_zero: (0,0,0,0,0,0,0,0)
+        )
+        let bindRes = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                bind(sockfd, sa, socklen_t(MemoryLayout<sockaddr_in>.stride))
+            }
+        }
+        guard bindRes >= 0 else { throw NSError(domain: "HTTPServer", code: 500, userInfo: [NSLocalizedDescriptionKey: "Bind error"]) }
+        listen(sockfd, 10)
+        self.listener = FileHandle(fileDescriptor: sockfd, closeOnDealloc: true)
     }
-    
-    // Start the default camera or specified camera
-    app.post("camera", "start") { req -> HTTPStatus in
-        let params = try? req.content.decode([String: String].self)
-        let cameraID = params?["camera_id"]
-        let width = Int(params?["width"] ?? "") ?? DEFAULT_RES_WIDTH
-        let height = Int(params?["height"] ?? "") ?? DEFAULT_RES_HEIGHT
-        let fps = Int(params?["fps"] ?? "") ?? DEFAULT_FPS
-        try CameraManager.shared.startCamera(cameraID: cameraID, width: width, height: height, fps: fps)
-        return .ok
-    }
-    
-    // Stop camera
-    app.post("camera", "stop") { req -> HTTPStatus in
-        CameraManager.shared.stopCamera()
-        return .ok
-    }
-    
-    // Switch camera
-    app.put("cameras", "select") { req -> HTTPStatus in
-        struct SwitchReq: Content { let camera_id: String }
-        let data = try req.content.decode(SwitchReq.self)
-        try CameraManager.shared.switchCamera(cameraID: data.camera_id)
-        return .ok
-    }
-    
-    // Stream video as MJPEG
-    app.get("camera", "stream") { req -> Response in
-        let boundary = "Boundary-\(UUID().uuidString)"
-        let res = Response(status: .ok)
-        res.headers.replaceOrAdd(name: .contentType, value: "multipart/x-mixed-replace; boundary=\(boundary)")
-        let stream = res.body.stream { writer in
-            do {
-                try CameraManager.shared.streamMJPEG { jpegData in
-                    var part = ""
-                    part += "--\(boundary)\r\n"
-                    part += "Content-Type: image/jpeg\r\n"
-                    part += "Content-Length: \(jpegData.count)\r\n\r\n"
-                    if let partData = part.data(using: .utf8) {
-                        try? writer.write(.buffer(ByteBuffer(data: partData))).wait()
-                        try? writer.write(.buffer(ByteBuffer(data: jpegData))).wait()
-                        try? writer.write(.buffer(ByteBuffer(string: "\r\n"))).wait()
+
+    func start() {
+        queue.async {
+            while self.shouldRun {
+                autoreleasepool {
+                    let clientFd = accept(self.listener.fileDescriptor, nil, nil)
+                    guard clientFd >= 0 else { return }
+                    let client = FileHandle(fileDescriptor: clientFd, closeOnDealloc: true)
+                    DispatchQueue.global().async {
+                        self.handle(client: client)
                     }
                 }
-            } catch {
-                _ = writer.write(.end)
             }
         }
-        res.body = stream
-        return res
+        print("HTTPServer running at http://\(Config.host):\(Config.port)")
+        RunLoop.current.run()
     }
-    
-    // Capture a single frame
-    app.get("camera", "capture") { req -> Response in
-        let format = req.query["format"] ?? "jpeg"
-        let width = Int(req.query["width"] ?? "") ?? DEFAULT_RES_WIDTH
-        let height = Int(req.query["height"] ?? "") ?? DEFAULT_RES_HEIGHT
-        let eventLoop = req.eventLoop
-        let promise = eventLoop.makePromise(of: Response.self)
-        _ = CameraManager.shared.captureFrame(format: format, width: width, height: height, eventLoop: eventLoop).map { (data, meta) in
-            var headers = HTTPHeaders()
-            headers.add(name: .contentType, value: "image/jpeg")
-            let response = Response(status: .ok, headers: headers, body: .init(data: data))
-            let jsonMeta = try? JSONSerialization.data(withJSONObject: meta, options: [])
-            if let jsonMeta = jsonMeta {
-                response.headers.replaceOrAdd(name: "X-Meta", value: String(data: jsonMeta, encoding: .utf8) ?? "")
-            }
-            promise.succeed(response)
-        }.flatMapError { error in
-            let resp = Response(status: .internalServerError)
-            try? resp.content.encode(["error": "\(error)"])
-            promise.succeed(resp)
-            return eventLoop.makeSucceededFuture(())
-        }
-        return promise.futureResult
+
+    func stop() {
+        shouldRun = false
+        self.listener.closeFile()
     }
-    
-    // Record video for duration (seconds)
-    app.post("camera", "record") { req -> Response in
-        struct RecordReq: Content { let duration: Int? }
-        let data = try req.content.decode(RecordReq.self)
-        let duration = data.duration ?? 5
-        let format = req.query["format"] ?? "mp4"
-        let width = Int(req.query["width"] ?? "") ?? DEFAULT_RES_WIDTH
-        let height = Int(req.query["height"] ?? "") ?? DEFAULT_RES_HEIGHT
-        let fps = Int(req.query["fps"] ?? "") ?? DEFAULT_FPS
-        let eventLoop = req.eventLoop
-        let promise = eventLoop.makePromise(of: Response.self)
-        _ = CameraManager.shared.recordVideo(duration: duration, format: format, width: width, height: height, fps: fps, eventLoop: eventLoop).map { (url, frameCount) in
-            defer { try? FileManager.default.removeItem(at: url) }
-            guard let fileData = try? Data(contentsOf: url) else {
-                let resp = Response(status: .internalServerError)
-                try? resp.content.encode(["error": "Failed to read recorded video file"])
-                promise.succeed(resp)
-                return
-            }
-            var headers = HTTPHeaders()
-            headers.add(name: .contentType, value: format == "avi" ? "video/x-msvideo" : "video/mp4")
-            headers.add(name: .contentDisposition, value: "attachment; filename=\"recording.\(format)\"")
-            let resp = Response(status: .ok, headers: headers, body: .init(data: fileData))
-            promise.succeed(resp)
-        }.flatMapError { error in
-            let resp = Response(status: .internalServerError)
-            try? resp.content.encode(["error": "\(error)"])
-            promise.succeed(resp)
-            return eventLoop.makeSucceededFuture(())
+
+    private func handle(client: FileHandle) {
+        guard let req = try? readHTTPRequest(from: client) else {
+            client.closeFile()
+            return
         }
-        return promise.futureResult
+        do {
+            switch (req.method, req.path) {
+            case ("GET", "/cameras"):
+                let list = CameraManager.shared.listCameras()
+                let data = try JSONSerialization.data(withJSONObject: ["cameras": list], options: [])
+                respond(client, code: 200, contentType: "application/json", body: data)
+            case ("POST", "/camera/start"):
+                try CameraManager.shared.startDefaultCamera()
+                respondJSON(client, ["status": "ok", "active_camera_id": CameraManager.shared.activeCameraId ?? ""])
+            case ("POST", "/camera/stop"):
+                try CameraManager.shared.stopCamera()
+                respondJSON(client, ["status": "ok"])
+            case ("PUT", "/cameras/select"):
+                guard let body = req.body else { throw httpErr(400, "No body") }
+                guard let json = try? JSONSerialization.jsonObject(with: body, options: []) as? [String: Any],
+                      let cameraId = json["camera_id"] as? String else {
+                    throw httpErr(400, "Invalid JSON or missing camera_id")
+                }
+                try CameraManager.shared.selectCamera(by: cameraId)
+                respondJSON(client, ["status": "ok", "active_camera_id": cameraId])
+            case ("GET", "/camera/stream"):
+                guard CameraManager.shared.isCameraActive() else {
+                    throw httpErr(400, "Camera not running")
+                }
+                // Switch to OutputStream
+                let output = OutputStream(toFileAtPath: "/dev/fd/\(client.fileDescriptor)", append: false)!
+                output.open()
+                let streamClient = StreamingClient(output: output)
+                CameraManager.shared.addStreamingClient(streamClient)
+                streamClient.start()
+                // Keep stream open as long as client is alive
+                var shouldRun = true
+                let deadline = Date().addingTimeInterval(30 * 60) // Max 30min
+                while shouldRun, Date() < deadline {
+                    sleep(1)
+                    if client.offsetInFile == 0 { // closed
+                        shouldRun = false
+                    }
+                }
+                streamClient.stop()
+                CameraManager.shared.removeStreamingClient(streamClient)
+            case ("GET", "/camera/capture"):
+                let (img, meta) = try CameraManager.shared.captureFrame()
+                let boundary = "FRAME_META_BOUNDARY"
+                let header = """
+                HTTP/1.1 200 OK\r
+                Content-Type: multipart/mixed; boundary=\(boundary)\r
+                \r
+                --\(boundary)\r
+                Content-Type: image/jpeg\r
+                Content-Disposition: attachment; filename="capture.jpg"\r
+                \r
+                """
+                client.write(Data(header.utf8))
+                client.write(img)
+                let metaPart = """
+
+                --\(boundary)\r
+                Content-Type: application/json\r
+                Content-Disposition: attachment; filename="meta.json"\r
+                \r
+                \(String(data: try! JSONSerialization.data(withJSONObject: meta, options: []), encoding: .utf8)!)\r
+                --\(boundary)--\r
+                """
+                client.write(Data(metaPart.utf8))
+            case ("POST", "/camera/record"):
+                guard CameraManager.shared.isCameraActive() else { throw httpErr(400, "Camera not running") }
+                guard let body = req.body else { throw httpErr(400, "No body") }
+                guard let json = try? JSONSerialization.jsonObject(with: body, options: []) as? [String: Any],
+                      let duration = json["duration"] as? Int else {
+                    throw httpErr(400, "Missing duration")
+                }
+                let tempDir = FileManager.default.temporaryDirectory
+                let filename = "record_\(Int(Date().timeIntervalSince1970)).mp4"
+                let fileURL = tempDir.appendingPathComponent(filename)
+                let group = DispatchGroup()
+                group.enter()
+                var recordSuccess = false
+                var recordError: String? = nil
+                CameraManager.shared.recordVideo(duration: duration, to: fileURL) { ok, err in
+                    recordSuccess = ok
+                    recordError = err
+                    group.leave()
+                }
+                group.wait()
+                if !recordSuccess {
+                    throw httpErr(500, recordError ?? "Recording failed")
+                }
+                let videoData = try Data(contentsOf: fileURL)
+                let headers = """
+                HTTP/1.1 200 OK\r
+                Content-Type: video/mp4\r
+                Content-Disposition: attachment; filename="record.mp4"\r
+                Content-Length: \(videoData.count)\r
+                \r
+                """
+                client.write(Data(headers.utf8))
+                client.write(videoData)
+                try? FileManager.default.removeItem(at: fileURL)
+            default:
+                respond(client, code: 404, contentType: "application/json", body: Data("{\"error\":\"Not found\"}".utf8))
+            }
+        } catch let err as HTTPError {
+            respond(client, code: err.status, contentType: "application/json", body: Data("{\"error\":\"\(err.message)\"}".utf8))
+        } catch {
+            respond(client, code: 500, contentType: "application/json", body: Data("{\"error\":\"\(error)\"}".utf8))
+        }
+        client.closeFile()
     }
 }
 
-// MARK: - Vapor Application Boot
+// MARK: - HTTP Helpers
 
-var env = try Environment.detect()
-let app = Application(env)
-defer { app.shutdown() }
-app.http.server.configuration.hostname = SERVER_HOST
-app.http.server.configuration.port = SERVER_PORT
-try routes(app)
-try app.run()
+struct HTTPRequest {
+    var method: String
+    var path: String
+    var headers: [String: String]
+    var body: Data?
+}
+
+func readHTTPRequest(from client: FileHandle) throws -> HTTPRequest {
+    var reqStr = ""
+    while true {
+        let data = client.readData(ofLength: 1024)
+        if data.isEmpty { break }
+        reqStr += String(data: data, encoding: .utf8) ?? ""
+        if reqStr.contains("\r\n\r\n") { break }
+    }
+    let lines = reqStr.components(separatedBy: "\r\n")
+    guard !lines.isEmpty else { throw httpErr(400, "Empty request") }
+    let firstLine = lines[0].split(separator: " ")
+    guard firstLine.count >= 2 else { throw httpErr(400, "Malformed request") }
+    let method = String(firstLine[0])
+    let path = String(firstLine[1])
+    var headers: [String: String] = [:]
+    var i = 1
+    while i < lines.count, lines[i] != "" {
+        let parts = lines[i].split(separator: ":", maxSplits: 1)
+        if parts.count == 2 {
+            headers[String(parts[0]).trimmingCharacters(in: .whitespaces)] = String(parts[1]).trimmingCharacters(in: .whitespaces)
+        }
+        i += 1
+    }
+    var body: Data?
+    if let cl = headers["Content-Length"], let clen = Int(cl) {
+        let remain = clen - (reqStr.split(separator: "\r\n\r\n", maxSplits: 1).last?.count ?? 0)
+        if remain > 0 {
+            let d = client.readData(ofLength: remain)
+            body = d
+        }
+    }
+    return HTTPRequest(method: method, path: path, headers: headers, body: body)
+}
+
+struct HTTPError: Error {
+    let status: Int
+    let message: String
+}
+func httpErr(_ status: Int, _ msg: String) -> HTTPError {
+    return HTTPError(status: status, message: msg)
+}
+
+func respond(_ client: FileHandle, code: Int, contentType: String, body: Data) {
+    let header = """
+    HTTP/1.1 \(code) \(httpStatusMsg(code))\r
+    Content-Type: \(contentType)\r
+    Content-Length: \(body.count)\r
+    Connection: close\r
+    \r
+    """
+    client.write(Data(header.utf8))
+    client.write(body)
+}
+
+func respondJSON(_ client: FileHandle, _ json: [String: Any]) {
+    let data = try! JSONSerialization.data(withJSONObject: json, options: [])
+    respond(client, code: 200, contentType: "application/json", body: data)
+}
+
+func httpStatusMsg(_ code: Int) -> String {
+    switch code {
+    case 200: return "OK"
+    case 400: return "Bad Request"
+    case 404: return "Not Found"
+    case 409: return "Conflict"
+    case 500: return "Internal Server Error"
+    default: return "Error"
+    }
+}
+
+// MARK: - CGImage to CMSampleBuffer (for recording)
+import AppKit
+func cgImageToSampleBuffer(_ cgImage: CGImage, width: Int, height: Int, time: CMTime) -> CMSampleBuffer? {
+    let pixelBufferAttributes: [CFString: Any] = [
+        kCVPixelBufferCGImageCompatibilityKey: true,
+        kCVPixelBufferCGBitmapContextCompatibilityKey: true
+    ]
+    var pxBuffer: CVPixelBuffer?
+    let status = CVPixelBufferCreate(
+        kCFAllocatorDefault,
+        width, height,
+        kCVPixelFormatType_32BGRA,
+        pixelBufferAttributes as CFDictionary,
+        &pxBuffer
+    )
+    guard status == kCVReturnSuccess, let buffer = pxBuffer else { return nil }
+    CVPixelBufferLockBaseAddress(buffer, [])
+    let context = CGContext(
+        data: CVPixelBufferGetBaseAddress(buffer),
+        width: width,
+        height: height,
+        bitsPerComponent: 8,
+        bytesPerRow: CVPixelBufferGetBytesPerRow(buffer),
+        space: CGColorSpaceCreateDeviceRGB(),
+        bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
+    )
+    context?.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+    CVPixelBufferUnlockBaseAddress(buffer, [])
+
+    var newSampleBuffer: CMSampleBuffer?
+    var timingInfo = CMSampleTimingInfo(duration: CMTime(value: 1, timescale: 30), presentationTimeStamp: time, decodeTimeStamp: .invalid)
+    var videoInfo: CMVideoFormatDescription?
+    CMVideoFormatDescriptionCreateForImageBuffer(allocator: kCFAllocatorDefault, imageBuffer: buffer, formatDescriptionOut: &videoInfo)
+    if let videoInfo = videoInfo {
+        CMSampleBufferCreateReadyWithImageBuffer(
+            allocator: kCFAllocatorDefault,
+            imageBuffer: buffer,
+            formatDescription: videoInfo,
+            sampleTiming: &timingInfo,
+            sampleBufferOut: &newSampleBuffer
+        )
+    }
+    return newSampleBuffer
+}
+
+// MARK: - Main
+
+// Start HTTP server
+do {
+    let server = try HTTPServer(host: Config.host, port: Config.port)
+    server.start()
+} catch {
+    print("Failed to start server: \(error)")
+    exit(1)
+}
