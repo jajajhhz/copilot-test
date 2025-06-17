@@ -1,291 +1,270 @@
 import os
 import io
-import cv2
-import time
-import json
 import threading
-import platform
+import time
+from typing import Optional, Tuple
+
 from flask import Flask, Response, request, jsonify, send_file
 
-app = Flask(__name__)
+import cv2
+import numpy as np
 
-# Environment Variables
-CAMERA_IDS = os.getenv("CAMERA_IDS")  # comma-separated, e.g. "0,1,2"
-DEFAULT_CAMERA_ID = int(os.getenv("DEFAULT_CAMERA_ID", "0"))
-HTTP_HOST = os.getenv("HTTP_HOST", "0.0.0.0")
-HTTP_PORT = int(os.getenv("HTTP_PORT", "8080"))
-DEFAULT_WIDTH = int(os.getenv("DEFAULT_RES_WIDTH", "640"))
-DEFAULT_HEIGHT = int(os.getenv("DEFAULT_RES_HEIGHT", "480"))
-DEFAULT_FPS = int(os.getenv("DEFAULT_FPS", "30"))
-SUPPORTED_FORMATS = ["JPEG", "PNG", "MP4", "MJPEG"]
+# ========== Config from environment variables ==========
+HTTP_HOST = os.environ.get("HTTP_HOST", "0.0.0.0")
+HTTP_PORT = int(os.environ.get("HTTP_PORT", "8080"))
+DEFAULT_CAMERA_ID = int(os.environ.get("CAMERA_ID", "0"))
+DEFAULT_RESOLUTION = (
+    int(os.environ.get("CAMERA_WIDTH", "640")),
+    int(os.environ.get("CAMERA_HEIGHT", "480")),
+)
+DEFAULT_FORMAT = os.environ.get("CAMERA_FORMAT", "MJPEG")  # JPEG, PNG, MP4, MJPEG
+DEFAULT_FRAME_RATE = int(os.environ.get("CAMERA_FRAME_RATE", "15"))
 
-# State
-class CameraState:
+# ========== Camera Manager ==========
+
+class CameraManager:
     def __init__(self):
-        self.cam_id = DEFAULT_CAMERA_ID
+        self.cameras = self._enumerate_cameras()
+        self.active_cam_id = self.cameras[0] if self.cameras else 0
         self.cap = None
-        self.is_running = False
-        self.width = DEFAULT_WIDTH
-        self.height = DEFAULT_HEIGHT
-        self.fps = DEFAULT_FPS
-        self.format = "MJPEG"
         self.lock = threading.Lock()
-        self.recording = False
-        self.record_thread = None
-        self.record_stop_event = threading.Event()
-        self.device_list = self.enumerate_cameras()
-        if self.cam_id not in self.device_list:
-            if self.device_list:
-                self.cam_id = self.device_list[0]
-            else:
-                self.cam_id = 0
+        self.is_streaming = False
+        self.format = DEFAULT_FORMAT.upper()
+        self.resolution = DEFAULT_RESOLUTION
+        self.frame_rate = DEFAULT_FRAME_RATE
+        self.last_frame = None
+        self.stream_thread = None
+        self.stop_stream_flag = threading.Event()
+        self._init_camera(self.active_cam_id)
 
-    def enumerate_cameras(self, max_test=10):
+    def _enumerate_cameras(self, max_tested=10):
         ids = []
-        if CAMERA_IDS:
-            ids = [int(x) for x in CAMERA_IDS.split(",")]
-            return ids
-        for i in range(max_test):
-            cap = cv2.VideoCapture(i, cv2.CAP_DSHOW if platform.system() == "Windows" else 0)
-            if cap is not None and cap.isOpened():
-                ids.append(i)
-                cap.release()
+        for idx in range(max_tested):
+            cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW if os.name == 'nt' else 0)
+            if cap.read()[0]:
+                ids.append(idx)
+            cap.release()
+        if not ids:
+            ids = [0]  # fallback for default
         return ids
 
-    def start_camera(self, cam_id=None, width=None, height=None, fps=None, fmt=None):
-        with self.lock:
-            if self.is_running:
-                return True
-            cam_id = cam_id if cam_id is not None else self.cam_id
-            if cam_id not in self.device_list:
-                return False
-            self.cap = cv2.VideoCapture(cam_id, cv2.CAP_DSHOW if platform.system() == "Windows" else 0)
-            if not self.cap.isOpened():
-                self.cap = None
-                return False
-            self.cam_id = cam_id
-            self.width = int(width or self.width)
-            self.height = int(height or self.height)
-            self.fps = int(fps or self.fps)
-            self.format = fmt.upper() if fmt and fmt.upper() in SUPPORTED_FORMATS else self.format
-            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-            self.cap.set(cv2.CAP_PROP_FPS, self.fps)
-            self.is_running = True
-            return True
-
-    def stop_camera(self):
+    def switch_camera(self, cam_id: int):
         with self.lock:
             if self.cap:
                 self.cap.release()
-            self.cap = None
-            self.is_running = False
-            self.record_stop_event.set()
-            self.recording = False
+            self._init_camera(cam_id)
 
-    def switch_camera(self, cam_id):
-        with self.lock:
-            if cam_id not in self.device_list:
-                return False
-            self.stop_camera()
-            return self.start_camera(cam_id)
+    def _init_camera(self, cam_id: int):
+        self.cap = cv2.VideoCapture(cam_id, cv2.CAP_DSHOW if os.name == 'nt' else 0)
+        # Try to set resolution
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.resolution[0])
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.resolution[1])
+        self.cap.set(cv2.CAP_PROP_FPS, self.frame_rate)
+        self.active_cam_id = cam_id
+        time.sleep(0.2)  # Let camera warm up
 
-    def set_resolution(self, width, height):
+    def start_camera(self, resolution=None, fmt=None, frame_rate=None):
         with self.lock:
-            self.width = int(width)
-            self.height = int(height)
-            if self.cap and self.is_running:
-                self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-                self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+            if resolution:
+                self.resolution = tuple(resolution)
+            if frame_rate:
+                self.frame_rate = frame_rate
+            if fmt:
+                self.format = fmt.upper()
+            self.switch_camera(self.active_cam_id)
+            self.is_streaming = True
+            self.stop_stream_flag.clear()
 
-    def set_format(self, fmt):
+    def stop_camera(self):
         with self.lock:
-            fmt = fmt.upper()
-            if fmt in SUPPORTED_FORMATS:
-                self.format = fmt
-                return True
-            return False
+            self.is_streaming = False
+            self.stop_stream_flag.set()
+            if self.cap:
+                self.cap.release()
+                self.cap = None
 
-    def get_frame(self):
+    def set_resolution(self, width: int, height: int):
         with self.lock:
-            if not self.cap or not self.is_running:
-                return None
+            self.resolution = (width, height)
+            if self.cap:
+                self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+                self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+
+    def set_format(self, fmt: str):
+        with self.lock:
+            self.format = fmt.upper()
+
+    def get_frame(self) -> Optional[np.ndarray]:
+        with self.lock:
+            if self.cap is None:
+                self._init_camera(self.active_cam_id)
             ret, frame = self.cap.read()
             if not ret:
                 return None
+            self.last_frame = frame
             return frame
 
-camera_state = CameraState()
-
-# Helper
-def encode_image(frame, fmt="JPEG"):
-    fmt = fmt.upper()
-    if fmt == "PNG":
-        ret, buf = cv2.imencode('.png', frame)
-        mime = "image/png"
-    else:
-        ret, buf = cv2.imencode('.jpg', frame)
-        mime = "image/jpeg"
-    if not ret:
-        return None, None
-    return buf.tobytes(), mime
-
-def mjpeg_stream_generator():
-    while camera_state.is_running:
-        frame = camera_state.get_frame()
-        if frame is not None:
-            img, mime = encode_image(frame, "JPEG")
-            if img:
-                yield (b'--frame\r\n'
-                       b'Content-Type: image/jpeg\r\n\r\n' + img + b'\r\n')
+    def capture_image(self, fmt: str = 'JPEG', resolution: Tuple[int, int] = None) -> Tuple[bytes, str]:
+        frame = self.get_frame()
+        if resolution:
+            frame = cv2.resize(frame, resolution)
+        fmt = fmt.upper()
+        if fmt == 'PNG':
+            ret, buf = cv2.imencode('.png', frame)
+            content_type = 'image/png'
         else:
-            time.sleep(0.05)
+            ret, buf = cv2.imencode('.jpg', frame)
+            content_type = 'image/jpeg'
+        if not ret:
+            raise RuntimeError("Failed to encode image")
+        return buf.tobytes(), content_type
 
-def mp4_record_thread(duration, width, height, fps, out_path):
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(out_path, fourcc, fps, (width, height))
-    start_time = time.time()
-    while (time.time() - start_time) < duration and not camera_state.record_stop_event.is_set():
-        frame = camera_state.get_frame()
-        if frame is not None:
-            frame = cv2.resize(frame, (width, height))
-            out.write(frame)
+    def stream_generator(self, fmt='MJPEG', resolution=None):
+        fmt = fmt.upper()
+        while not self.stop_stream_flag.is_set():
+            frame = self.get_frame()
+            if frame is None:
+                continue
+            if resolution:
+                frame = cv2.resize(frame, resolution)
+            if fmt == 'PNG':
+                ret, buf = cv2.imencode('.png', frame)
+                img_bytes = buf.tobytes()
+                content_type = 'image/png'
+            else:
+                ret, buf = cv2.imencode('.jpg', frame)
+                img_bytes = buf.tobytes()
+                content_type = 'image/jpeg'
+            if not ret:
+                continue
+            yield (b'--frame\r\n'
+                   b'Content-Type: ' + content_type.encode() + b'\r\n\r\n' + img_bytes + b'\r\n')
+            time.sleep(1.0 / self.frame_rate)
+
+    def record_video(self, duration: float, fmt='MP4', resolution=None, frame_rate=None) -> Tuple[bytes, str]:
+        fmt = fmt.upper()
+        if not resolution:
+            resolution = self.resolution
+        if not frame_rate:
+            frame_rate = self.frame_rate
+        ext = '.mp4' if fmt == 'MP4' else '.avi'
+        fourcc = cv2.VideoWriter_fourcc(*('mp4v' if fmt == 'MP4' else 'MJPG'))
+        temp_file = 'temp_record' + ext
+        writer = cv2.VideoWriter(temp_file, fourcc, frame_rate, resolution)
+        t_end = time.time() + min(duration, 60)
+        frames_written = 0
+        while time.time() < t_end:
+            frame = self.get_frame()
+            if frame is None:
+                continue
+            if resolution:
+                frame = cv2.resize(frame, resolution)
+            writer.write(frame)
+            frames_written += 1
+            time.sleep(1.0 / frame_rate)
+        writer.release()
+        with open(temp_file, 'rb') as f:
+            video_bytes = f.read()
+        os.remove(temp_file)
+        if fmt == 'MP4':
+            return video_bytes, 'video/mp4'
         else:
-            time.sleep(0.01)
-    out.release()
-    camera_state.recording = False
+            return video_bytes, 'video/x-motion-jpeg'
 
-def mjpeg_record_thread(duration, width, height, fps, out_path):
-    fourcc = cv2.VideoWriter_fourcc(*'MJPG')
-    out = cv2.VideoWriter(out_path, fourcc, fps, (width, height))
-    start_time = time.time()
-    while (time.time() - start_time) < duration and not camera_state.record_stop_event.is_set():
-        frame = camera_state.get_frame()
-        if frame is not None:
-            frame = cv2.resize(frame, (width, height))
-            out.write(frame)
-        else:
-            time.sleep(0.01)
-    out.release()
-    camera_state.recording = False
+    def list_cameras(self):
+        return self.cameras
 
-@app.route("/cam/start", methods=["POST"])
-def cam_start():
-    params = request.args if request.args else {}
+# ========== Flask HTTP API ==========
+
+app = Flask(__name__)
+cam_mgr = CameraManager()
+
+@app.route('/cam/start', methods=['POST'])
+def start_camera():
+    params = request.args
     data = request.get_json(silent=True) or {}
-    cam_id = int(params.get("cam_id", data.get("cam_id", camera_state.cam_id)))
-    width = int(params.get("width", data.get("width", camera_state.width)))
-    height = int(params.get("height", data.get("height", camera_state.height)))
-    fps = int(params.get("fps", data.get("fps", camera_state.fps)))
-    fmt = params.get("format", data.get("format", camera_state.format))
-    ok = camera_state.start_camera(cam_id, width, height, fps, fmt)
-    if ok:
-        return jsonify({"status": "started", "cam_id": cam_id, "width": width, "height": height, "fps": fps, "format": camera_state.format})
-    else:
-        return jsonify({"status": "error", "message": "Failed to start camera."}), 500
+    width = int(params.get('width', data.get('width', cam_mgr.resolution[0])))
+    height = int(params.get('height', data.get('height', cam_mgr.resolution[1])))
+    fmt = params.get('format', data.get('format', cam_mgr.format))
+    frame_rate = int(params.get('frame_rate', data.get('frame_rate', cam_mgr.frame_rate)))
+    cam_id = int(params.get('cam_id', data.get('cam_id', cam_mgr.active_cam_id)))
+    if cam_id not in cam_mgr.list_cameras():
+        return jsonify({"error": f"Camera ID {cam_id} not found"}), 404
+    cam_mgr.active_cam_id = cam_id
+    cam_mgr.start_camera(resolution=(width, height), fmt=fmt, frame_rate=frame_rate)
+    return jsonify({"status": "started", "cam_id": cam_id, "resolution": [width, height], "format": fmt, "frame_rate": frame_rate})
 
-@app.route("/cam/stop", methods=["POST"])
-def cam_stop():
-    camera_state.stop_camera()
+@app.route('/cam/stop', methods=['POST'])
+def stop_camera():
+    cam_mgr.stop_camera()
     return jsonify({"status": "stopped"})
 
-@app.route("/cam/capture", methods=["GET"])
-def cam_capture():
-    fmt = request.args.get("format", camera_state.format).upper()
-    width = int(request.args.get("width", camera_state.width))
-    height = int(request.args.get("height", camera_state.height))
-    frame = camera_state.get_frame()
-    if frame is None:
-        return jsonify({"status": "error", "message": "Camera not running or no frame available."}), 500
-    if frame.shape[1] != width or frame.shape[0] != height:
-        frame = cv2.resize(frame, (width, height))
-    img, mime = encode_image(frame, fmt)
-    if img is None:
-        return jsonify({"status": "error", "message": "Frame encode error."}), 500
-    return Response(img, mimetype=mime, headers={"Content-Disposition": f"inline; filename=capture.{fmt.lower()}"})
+@app.route('/cam/capture', methods=['GET'])
+def capture_image():
+    fmt = request.args.get('format', cam_mgr.format)
+    width = request.args.get('width', cam_mgr.resolution[0])
+    height = request.args.get('height', cam_mgr.resolution[1])
+    try:
+        width, height = int(width), int(height)
+    except ValueError:
+        width, height = cam_mgr.resolution
+    img_bytes, content_type = cam_mgr.capture_image(fmt, (width, height))
+    return Response(img_bytes, mimetype=content_type)
 
-@app.route("/cam/stream", methods=["GET"])
-def cam_stream():
-    fmt = request.args.get("format", camera_state.format).upper()
-    width = int(request.args.get("width", camera_state.width))
-    height = int(request.args.get("height", camera_state.height))
-    fps = int(request.args.get("fps", camera_state.fps))
-    if fmt == "MJPEG":
-        def generator():
-            while camera_state.is_running:
-                frame = camera_state.get_frame()
-                if frame is not None:
-                    if frame.shape[1] != width or frame.shape[0] != height:
-                        frame = cv2.resize(frame, (width, height))
-                    img, mime = encode_image(frame, "JPEG")
-                    if img:
-                        yield (b'--frame\r\n'
-                               b'Content-Type: image/jpeg\r\n\r\n' + img + b'\r\n')
-                else:
-                    time.sleep(0.03)
-        return Response(generator(), mimetype='multipart/x-mixed-replace; boundary=frame')
-    else:
-        return jsonify({"status": "error", "message": "Only MJPEG stream is supported for HTTP streaming."}), 400
+@app.route('/cam/stream', methods=['GET'])
+def stream_video():
+    fmt = request.args.get('format', cam_mgr.format)
+    width = request.args.get('width', cam_mgr.resolution[0])
+    height = request.args.get('height', cam_mgr.resolution[1])
+    try:
+        width, height = int(width), int(height)
+    except ValueError:
+        width, height = cam_mgr.resolution
+    cam_mgr.start_camera(resolution=(width, height), fmt=fmt)
+    return Response(cam_mgr.stream_generator(fmt, (width, height)),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
 
-@app.route("/cam/record", methods=["POST"])
-def cam_record():
-    if camera_state.recording:
-        return jsonify({"status": "error", "message": "Already recording."}), 409
+@app.route('/cam/record', methods=['POST'])
+def record_video():
     data = request.get_json(force=True)
-    duration = float(data.get("duration", 5.0))
-    duration = max(0.1, min(duration, 60.0))
-    width = int(data.get("width", camera_state.width))
-    height = int(data.get("height", camera_state.height))
-    fps = int(data.get("fps", camera_state.fps))
-    fmt = data.get("format", camera_state.format).upper()
-    if fmt not in ("MP4", "MJPEG"):
-        return jsonify({"status": "error", "message": "Unsupported format for recording."}), 400
-    ext = ".mp4" if fmt == "MP4" else ".avi"
-    out_path = f"/tmp/record_{int(time.time())}{ext}"
-    camera_state.record_stop_event.clear()
-    camera_state.recording = True
-    if fmt == "MP4":
-        t = threading.Thread(target=mp4_record_thread, args=(duration, width, height, fps, out_path), daemon=True)
-    else:
-        t = threading.Thread(target=mjpeg_record_thread, args=(duration, width, height, fps, out_path), daemon=True)
-    camera_state.record_thread = t
-    t.start()
-    t.join()
-    if os.path.exists(out_path):
-        resp = send_file(out_path, mimetype="video/mp4" if fmt == "MP4" else "video/x-msvideo", as_attachment=True)
-        os.remove(out_path)
-        return resp
-    else:
-        return jsonify({"status": "error", "message": "Recording failed."}), 500
+    duration = float(data.get('duration', 10))
+    duration = min(duration, 60)
+    fmt = data.get('format', cam_mgr.format)
+    width = int(data.get('width', cam_mgr.resolution[0]))
+    height = int(data.get('height', cam_mgr.resolution[1]))
+    frame_rate = int(data.get('frame_rate', cam_mgr.frame_rate))
+    cam_mgr.start_camera(resolution=(width, height), fmt=fmt, frame_rate=frame_rate)
+    video_bytes, content_type = cam_mgr.record_video(duration, fmt, (width, height), frame_rate)
+    return Response(video_bytes, mimetype=content_type,
+                    headers={"Content-Disposition": f"attachment; filename=recording.{fmt.lower()}"})
 
-@app.route("/cam/res", methods=["PUT"])
-def cam_res():
+@app.route('/cam/res', methods=['PUT'])
+def set_resolution():
     data = request.get_json(force=True)
-    width = int(data.get("width", camera_state.width))
-    height = int(data.get("height", camera_state.height))
-    camera_state.set_resolution(width, height)
-    return jsonify({"status": "ok", "width": camera_state.width, "height": camera_state.height})
+    width = int(data.get('width', cam_mgr.resolution[0]))
+    height = int(data.get('height', cam_mgr.resolution[1]))
+    cam_mgr.set_resolution(width, height)
+    return jsonify({"status": "ok", "resolution": [width, height]})
 
-@app.route("/cam/form", methods=["PUT"])
-def cam_form():
+@app.route('/cam/form', methods=['PUT'])
+def set_format():
     data = request.get_json(force=True)
-    fmt = data.get("format", camera_state.format).upper()
-    if not camera_state.set_format(fmt):
-        return jsonify({"status": "error", "message": "Unsupported format."}), 400
-    return jsonify({"status": "ok", "format": camera_state.format})
+    fmt = data.get('format', cam_mgr.format)
+    cam_mgr.set_format(fmt)
+    return jsonify({"status": "ok", "format": fmt})
 
-@app.route("/cam/devices", methods=["GET"])
-def cam_devices():
-    return jsonify({"devices": camera_state.device_list, "current": camera_state.cam_id})
+@app.route('/cam/list', methods=['GET'])
+def list_cameras():
+    return jsonify({"cameras": cam_mgr.list_cameras(), "active": cam_mgr.active_cam_id})
 
-@app.route("/cam/switch", methods=["POST"])
-def cam_switch():
+@app.route('/cam/switch', methods=['POST'])
+def switch_camera():
     data = request.get_json(force=True)
-    cam_id = int(data.get("cam_id", camera_state.cam_id))
-    if camera_state.switch_camera(cam_id):
-        return jsonify({"status": "ok", "cam_id": cam_id})
-    else:
-        return jsonify({"status": "error", "message": "Camera id not found."}), 404
+    cam_id = int(data.get('cam_id', cam_mgr.active_cam_id))
+    if cam_id not in cam_mgr.list_cameras():
+        return jsonify({"error": f"Camera ID {cam_id} not found"}), 404
+    cam_mgr.switch_camera(cam_id)
+    return jsonify({"status": "ok", "active_cam_id": cam_id})
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     app.run(host=HTTP_HOST, port=HTTP_PORT, threaded=True)
