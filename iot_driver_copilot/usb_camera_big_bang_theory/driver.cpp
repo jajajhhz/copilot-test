@@ -1,502 +1,530 @@
-#include <cstdlib>
-#include <cstring>
 #include <iostream>
-#include <string>
+#include <cstdlib>
 #include <thread>
 #include <atomic>
 #include <mutex>
 #include <vector>
 #include <condition_variable>
+#include <cstring>
 #include <map>
 #include <sstream>
+#include <algorithm>
 
 #include <sys/types.h>
 #include <sys/socket.h>
-#include <sys/select.h>
 #include <netinet/in.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <signal.h>
 
 #include <linux/videodev2.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <errno.h>
 
-#define MAX_CLIENTS 16
-#define BOUNDARY "frameboundary"
-#define DEFAULT_VIDEO_DEVICE "/dev/video0"
 #define DEFAULT_HTTP_PORT 8080
-#define DEFAULT_RESOLUTION_WIDTH 640
-#define DEFAULT_RESOLUTION_HEIGHT 480
+#define DEFAULT_SERVER_HOST "0.0.0.0"
+#define DEFAULT_VIDEO_DEVICE "/dev/video0"
+#define MAX_CLIENTS 32
+#define BOUNDARY "usb_cam_mjpeg_boundary"
+#define MJPEG_FRAME_TIMEOUT_MS 100
 
-struct Buffer {
-    void* start;
-    size_t length;
-};
+// Utility: trim
+static inline std::string trim(const std::string& s) {
+    auto start = s.begin();
+    while (start != s.end() && std::isspace(*start)) start++;
+    auto end = s.end();
+    do {
+        end--;
+    } while (std::distance(start, end) > 0 && std::isspace(*end));
+    return std::string(start, end+1);
+}
 
-enum CaptureStatus {
-    CAPTURE_STOPPED,
-    CAPTURE_RUNNING
-};
-
+// Camera abstraction
 class USBCamera {
 public:
-    USBCamera();
-    ~USBCamera();
+    USBCamera(const std::string& dev, int width, int height, const std::string& pixel_format)
+    : devname(dev), width(width), height(height), pixel_format(pixel_format), fd(-1), buffers(nullptr), n_buffers(0), capturing(false) {}
 
-    bool openDevice(const std::string& dev, int width, int height, const std::string& format);
-    void closeDevice();
-    bool startCapture();
-    bool stopCapture();
-    bool grabFrame(std::vector<unsigned char>& out, std::string& outFormat, int reqWidth, int reqHeight, const std::string& reqFormat);
-    bool isCapturing();
+    ~USBCamera() {
+        stopCapture();
+        closeDevice();
+    }
 
-    // for streaming
-    bool getLatestMJPEGFrame(std::vector<unsigned char>& out);
+    bool openDevice() {
+        fd = open(devname.c_str(), O_RDWR | O_NONBLOCK, 0);
+        return fd != -1;
+    }
 
-    int defaultWidth = DEFAULT_RESOLUTION_WIDTH;
-    int defaultHeight = DEFAULT_RESOLUTION_HEIGHT;
-    std::string defaultFormat = "mjpeg";
+    void closeDevice() {
+        if (fd != -1) {
+            close(fd);
+            fd = -1;
+        }
+    }
+
+    bool initDevice() {
+        struct v4l2_capability cap;
+        if (ioctl(fd, VIDIOC_QUERYCAP, &cap) == -1) return false;
+
+        struct v4l2_format fmt;
+        memset(&fmt, 0, sizeof(fmt));
+        fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+
+        if (pixel_format == "mjpeg" || pixel_format == "MJPEG") {
+            fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_MJPEG;
+        } else {
+            fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
+        }
+        fmt.fmt.pix.width = width;
+        fmt.fmt.pix.height = height;
+
+        if (ioctl(fd, VIDIOC_S_FMT, &fmt) == -1) return false;
+
+        // Request buffers
+        struct v4l2_requestbuffers req;
+        memset(&req, 0, sizeof(req));
+        req.count = 4;
+        req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        req.memory = V4L2_MEMORY_MMAP;
+        if (ioctl(fd, VIDIOC_REQBUFS, &req) == -1) return false;
+        if (req.count < 2) return false;
+
+        buffers = (buffer*)calloc(req.count, sizeof(*buffers));
+        if (!buffers) return false;
+
+        for (n_buffers = 0; n_buffers < req.count; ++n_buffers) {
+            struct v4l2_buffer buf;
+            memset(&buf, 0, sizeof(buf));
+            buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+            buf.memory = V4L2_MEMORY_MMAP;
+            buf.index = n_buffers;
+            if (ioctl(fd, VIDIOC_QUERYBUF, &buf) == -1) return false;
+
+            buffers[n_buffers].length = buf.length;
+            buffers[n_buffers].start = mmap(NULL, buf.length,
+                                            PROT_READ | PROT_WRITE, MAP_SHARED,
+                                            fd, buf.m.offset);
+            if (buffers[n_buffers].start == MAP_FAILED) return false;
+        }
+
+        return true;
+    }
+
+    bool startCapture() {
+        if (capturing) return true;
+
+        for (unsigned int i = 0; i < n_buffers; ++i) {
+            struct v4l2_buffer buf;
+            memset(&buf, 0, sizeof(buf));
+            buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+            buf.memory = V4L2_MEMORY_MMAP;
+            buf.index = i;
+            if (ioctl(fd, VIDIOC_QBUF, &buf) == -1) return false;
+        }
+        enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        if (ioctl(fd, VIDIOC_STREAMON, &type) == -1) return false;
+        capturing = true;
+        return true;
+    }
+
+    void stopCapture() {
+        if (!capturing) return;
+        enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        ioctl(fd, VIDIOC_STREAMOFF, &type);
+        capturing = false;
+    }
+
+    bool readFrame(std::vector<uint8_t>& out, std::string* out_fmt = nullptr) {
+        fd_set fds;
+        struct timeval tv;
+        FD_ZERO(&fds);
+        FD_SET(fd, &fds);
+        tv.tv_sec = 1;
+        tv.tv_usec = 0;
+        int r = select(fd + 1, &fds, NULL, NULL, &tv);
+        if (r == -1) return false;
+        if (r == 0) return false;
+
+        struct v4l2_buffer buf;
+        memset(&buf, 0, sizeof(buf));
+        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        buf.memory = V4L2_MEMORY_MMAP;
+        if (ioctl(fd, VIDIOC_DQBUF, &buf) == -1) return false;
+        out.resize(buf.bytesused);
+        memcpy(out.data(), buffers[buf.index].start, buf.bytesused);
+
+        if (out_fmt) {
+            if (pixel_format == "mjpeg" || pixel_format == "MJPEG")
+                *out_fmt = "jpeg";
+            else
+                *out_fmt = "yuyv";
+        }
+
+        ioctl(fd, VIDIOC_QBUF, &buf);
+        return true;
+    }
+
+    int getWidth() const { return width; }
+    int getHeight() const { return height; }
+    std::string getPixelFormat() const { return pixel_format; }
 
 private:
-    bool initMMap();
-    void uninitMMap();
-    bool readFrame(std::vector<unsigned char>& out);
+    struct buffer {
+        void   *start;
+        size_t length;
+    };
+    std::string devname;
+    int width, height;
+    std::string pixel_format;
     int fd;
-    Buffer* buffers;
+    buffer *buffers;
     unsigned int n_buffers;
-    std::mutex mtx;
-    std::atomic<CaptureStatus> status;
-    std::vector<unsigned char> lastMJPEGFrame;
-    std::condition_variable frameReady;
+    bool capturing;
 };
 
-USBCamera::USBCamera() : fd(-1), buffers(nullptr), n_buffers(0), status(CAPTURE_STOPPED) {}
-USBCamera::~USBCamera() { closeDevice(); }
-
-bool USBCamera::openDevice(const std::string& dev, int width, int height, const std::string& format) {
-    std::lock_guard<std::mutex> lock(mtx);
-    if (fd != -1) return true;
-    fd = ::open(dev.c_str(), O_RDWR | O_NONBLOCK, 0);
-    if (fd == -1) return false;
-
-    struct v4l2_capability cap;
-    if (ioctl(fd, VIDIOC_QUERYCAP, &cap) == -1) return false;
-
-    struct v4l2_format fmt;
-    memset(&fmt, 0, sizeof(fmt));
-    fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-
-    if (format == "jpeg" || format == "mjpeg")
-        fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_MJPEG;
-    else
-        fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
-
-    fmt.fmt.pix.width = width;
-    fmt.fmt.pix.height = height;
-
-    if (ioctl(fd, VIDIOC_S_FMT, &fmt) == -1) return false;
-    defaultWidth = width;
-    defaultHeight = height;
-    defaultFormat = format;
-    return initMMap();
-}
-
-void USBCamera::closeDevice() {
-    std::lock_guard<std::mutex> lock(mtx);
-    if (fd != -1) {
-        stopCapture();
-        uninitMMap();
-        ::close(fd);
-        fd = -1;
-    }
-}
-
-bool USBCamera::initMMap() {
-    struct v4l2_requestbuffers req;
-    memset(&req, 0, sizeof(req));
-    req.count = 4;
-    req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    req.memory = V4L2_MEMORY_MMAP;
-
-    if (ioctl(fd, VIDIOC_REQBUFS, &req) == -1) return false;
-    buffers = (Buffer*)calloc(req.count, sizeof(*buffers));
-    if (!buffers) return false;
-
-    for (n_buffers = 0; n_buffers < req.count; ++n_buffers) {
-        struct v4l2_buffer buf;
-        memset(&buf, 0, sizeof(buf));
-        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        buf.memory = V4L2_MEMORY_MMAP;
-        buf.index = n_buffers;
-
-        if (ioctl(fd, VIDIOC_QUERYBUF, &buf) == -1) return false;
-        buffers[n_buffers].length = buf.length;
-        buffers[n_buffers].start = mmap(NULL, buf.length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, buf.m.offset);
-        if (buffers[n_buffers].start == MAP_FAILED) return false;
-    }
-    return true;
-}
-
-void USBCamera::uninitMMap() {
-    for (unsigned int i = 0; i < n_buffers; ++i)
-        if (buffers[i].start)
-            munmap(buffers[i].start, buffers[i].length);
-    free(buffers);
-    buffers = nullptr;
-    n_buffers = 0;
-}
-
-bool USBCamera::startCapture() {
-    std::lock_guard<std::mutex> lock(mtx);
-    if (status == CAPTURE_RUNNING) return true;
-    for (unsigned int i = 0; i < n_buffers; ++i) {
-        struct v4l2_buffer buf;
-        memset(&buf, 0, sizeof(buf));
-        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        buf.memory = V4L2_MEMORY_MMAP;
-        buf.index = i;
-        if (ioctl(fd, VIDIOC_QBUF, &buf) == -1) return false;
-    }
-    enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    if (ioctl(fd, VIDIOC_STREAMON, &type) == -1) return false;
-    status = CAPTURE_RUNNING;
-    return true;
-}
-
-bool USBCamera::stopCapture() {
-    std::lock_guard<std::mutex> lock(mtx);
-    if (status == CAPTURE_STOPPED) return true;
-    enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    if (ioctl(fd, VIDIOC_STREAMOFF, &type) == -1) return false;
-    status = CAPTURE_STOPPED;
-    return true;
-}
-
-bool USBCamera::isCapturing() {
-    return status == CAPTURE_RUNNING;
-}
-
-bool USBCamera::readFrame(std::vector<unsigned char>& out) {
-    struct v4l2_buffer buf;
-    memset(&buf, 0, sizeof(buf));
-    buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    buf.memory = V4L2_MEMORY_MMAP;
-
-    if (ioctl(fd, VIDIOC_DQBUF, &buf) == -1) {
-        if (errno == EAGAIN) return false;
-        return false;
-    }
-
-    unsigned char* data = static_cast<unsigned char*>(buffers[buf.index].start);
-    out.assign(data, data + buf.bytesused);
-
-    // For streaming (MJPEG only)
-    if (defaultFormat == "mjpeg" || defaultFormat == "jpeg") {
-        std::unique_lock<std::mutex> l(mtx);
-        lastMJPEGFrame = out;
-        frameReady.notify_all();
-    }
-
-    if (ioctl(fd, VIDIOC_QBUF, &buf) == -1) return false;
-    return true;
-}
-
-bool USBCamera::grabFrame(std::vector<unsigned char>& out, std::string& outFormat, int reqWidth, int reqHeight, const std::string& reqFormat) {
-    if (!isCapturing()) return false;
-    fd_set fds;
-    struct timeval tv;
-    int r;
-
-    FD_ZERO(&fds);
-    FD_SET(fd, &fds);
-    tv.tv_sec = 2;
-    tv.tv_usec = 0;
-
-    r = select(fd+1, &fds, NULL, NULL, &tv);
-
-    if (r == -1) return false;
-    if (r == 0) return false;
-
-    std::vector<unsigned char> frame;
-    if (!readFrame(frame)) return false;
-
-    // For now, return in current format
-    if (reqFormat == "jpeg" || reqFormat == "mjpeg" || defaultFormat == "mjpeg" || defaultFormat == "jpeg") {
-        out = frame;
-        outFormat = "jpeg";
-        return true;
-    } else if (defaultFormat == "yuyv" && reqFormat == "jpeg") {
-        // TODO: YUYV to JPEG conversion (needs a JPEG encoder, omitted here)
-        return false;
-    } else {
-        out = frame;
-        outFormat = defaultFormat;
-        return true;
-    }
-}
-
-bool USBCamera::getLatestMJPEGFrame(std::vector<unsigned char>& out) {
-    std::unique_lock<std::mutex> lock(mtx);
-    if (lastMJPEGFrame.size() > 0) {
-        out = lastMJPEGFrame;
-        return true;
-    }
-    return false;
-}
-
-// HTTP server code
-
+// HTTP server
 class HTTPServer {
 public:
-    HTTPServer(USBCamera* cam, int port);
-    void start();
+    HTTPServer(const std::string& host, int port, USBCamera& camera)
+    : host(host), port(port), camera(camera), running(false), capture_on(false) {}
+
+    void start() {
+        running = true;
+        int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (server_fd < 0) exit(1);
+
+        int enable = 1;
+        setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(int));
+
+        struct sockaddr_in addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = inet_addr(host.c_str());
+        addr.sin_port = htons(port);
+
+        if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) exit(1);
+        if (listen(server_fd, MAX_CLIENTS) < 0) exit(1);
+
+        std::thread([this] { this->captureLoop(); }).detach();
+
+        while (running) {
+            struct sockaddr_in cli_addr;
+            socklen_t cli_len = sizeof(cli_addr);
+            int client_fd = accept(server_fd, (struct sockaddr*)&cli_addr, &cli_len);
+            if (client_fd < 0) continue;
+            std::thread([this, client_fd]() { this->handleClient(client_fd); }).detach();
+        }
+        close(server_fd);
+    }
+
+    void stop() {
+        running = false;
+    }
 
 private:
-    void handleClient(int clientSock);
-    void streamMJPEG(int clientSock, std::map<std::string, std::string>& query);
-    void sendSnapshot(int clientSock, std::map<std::string, std::string>& query);
-    void sendStart(int clientSock);
-    void sendStop(int clientSock);
-    void sendNotFound(int clientSock);
-
-    USBCamera* camera;
+    std::string host;
     int port;
+    USBCamera& camera;
     std::atomic<bool> running;
-    std::thread serverThread;
+    std::atomic<bool> capture_on;
+    std::mutex capture_mutex;
+    std::condition_variable capture_cv;
+
+    // For /camera/stream clients
+    struct StreamClient {
+        int fd;
+        std::string format;
+        StreamClient(int f, const std::string& fmt) : fd(f), format(fmt) {}
+    };
+    std::mutex stream_clients_mutex;
+    std::vector<StreamClient> stream_clients;
+
+    // For frame buffer (single frame snapshot)
+    std::mutex frame_mutex;
+    std::vector<uint8_t> last_frame;
+    std::string last_frame_fmt;
+
+    // For reading HTTP requests
+    static std::string readLine(int fd) {
+        std::string line;
+        char c;
+        while (read(fd, &c, 1) == 1) {
+            if (c == '\r') continue;
+            if (c == '\n') break;
+            line += c;
+        }
+        return line;
+    }
+
+    static void sendHTTP(int fd, const std::string& data) {
+        size_t sent = 0;
+        while (sent < data.size()) {
+            ssize_t n = write(fd, data.data()+sent, data.size()-sent);
+            if (n <= 0) break;
+            sent += n;
+        }
+    }
+
+    static void sendHTTP(int fd, const uint8_t* data, size_t sz) {
+        size_t sent = 0;
+        while (sent < sz) {
+            ssize_t n = write(fd, data+sent, sz-sent);
+            if (n <= 0) break;
+            sent += n;
+        }
+    }
+
+    // Parse query string
+    static std::map<std::string, std::string> parseQuery(const std::string& uri) {
+        std::map<std::string, std::string> params;
+        auto qm = uri.find('?');
+        if (qm == std::string::npos) return params;
+        std::string q = uri.substr(qm+1);
+        std::istringstream iss(q);
+        std::string kv;
+        while (std::getline(iss, kv, '&')) {
+            auto eq = kv.find('=');
+            if (eq != std::string::npos) {
+                params[kv.substr(0,eq)] = kv.substr(eq+1);
+            }
+        }
+        return params;
+    }
+
+    // Parse path without query
+    static std::string uriPath(const std::string& uri) {
+        size_t qm = uri.find('?');
+        return uri.substr(0, qm == std::string::npos ? uri.size() : qm);
+    }
+
+    void handleClient(int client_fd) {
+        std::string reqline = readLine(client_fd);
+        if (reqline.empty()) {
+            close(client_fd);
+            return;
+        }
+        std::istringstream iss(reqline);
+        std::string method, uri, ver;
+        iss >> method >> uri >> ver;
+
+        // Read headers (ignore for now)
+        std::map<std::string, std::string> headers;
+        while (true) {
+            std::string h = readLine(client_fd);
+            if (h.empty()) break;
+            auto p = h.find(':');
+            if (p != std::string::npos) {
+                headers[trim(h.substr(0,p))] = trim(h.substr(p+1));
+            }
+        }
+
+        // POST data
+        std::string body;
+        if (method == "POST") {
+            auto it = headers.find("Content-Length");
+            if (it != headers.end()) {
+                int clen = std::stoi(it->second);
+                body.resize(clen);
+                int got = 0;
+                while (got < clen) {
+                    int r = read(client_fd, &body[got], clen-got);
+                    if (r <= 0) break;
+                    got += r;
+                }
+            }
+        }
+
+        if (method == "GET" && uriPath(uri) == "/camera/frame") {
+            handleCameraFrame(client_fd, parseQuery(uri));
+        } else if (method == "GET" && uriPath(uri) == "/camera/stream") {
+            handleCameraStream(client_fd, parseQuery(uri));
+        } else if (method == "POST" && uriPath(uri) == "/camera/start") {
+            handleCameraStart(client_fd, body);
+        } else if (method == "POST" && uriPath(uri) == "/camera/stop") {
+            handleCameraStop(client_fd);
+        } else {
+            std::string resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+            sendHTTP(client_fd, resp);
+            close(client_fd);
+        }
+    }
+
+    // /camera/start
+    void handleCameraStart(int fd, const std::string&) {
+        {
+            std::lock_guard<std::mutex> lk(capture_mutex);
+            if (!capture_on) {
+                capture_on = true;
+                capture_cv.notify_all();
+            }
+        }
+        std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"result\":\"started\"}";
+        sendHTTP(fd, resp);
+        close(fd);
+    }
+
+    // /camera/stop
+    void handleCameraStop(int fd) {
+        {
+            std::lock_guard<std::mutex> lk(capture_mutex);
+            capture_on = false;
+        }
+        std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"result\":\"stopped\"}";
+        sendHTTP(fd, resp);
+        close(fd);
+    }
+
+    // /camera/frame
+    void handleCameraFrame(int fd, const std::map<std::string,std::string>& params) {
+        std::string fmt = "jpeg";
+        if (params.count("format")) fmt = params.at("format");
+        std::string res = "";
+        if (params.count("resolution")) res = params.at("resolution");
+
+        // Optional: adjust camera resolution or pixel format based on params
+
+        // Get latest frame
+        std::vector<uint8_t> frame;
+        std::string frame_fmt;
+        {
+            std::unique_lock<std::mutex> lk(frame_mutex);
+            if (!last_frame.empty()) {
+                frame = last_frame;
+                frame_fmt = last_frame_fmt;
+            } else {
+                std::string resp = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n";
+                sendHTTP(fd, resp);
+                close(fd);
+                return;
+            }
+        }
+        std::string ctype;
+        if (frame_fmt == "jpeg") ctype = "image/jpeg";
+        else ctype = "application/octet-stream";
+
+        std::ostringstream oss;
+        oss << "HTTP/1.1 200 OK\r\n"
+            << "Content-Type: " << ctype << "\r\n"
+            << "Content-Length: " << frame.size() << "\r\n"
+            << "Cache-Control: no-cache\r\n"
+            << "\r\n";
+        sendHTTP(fd, oss.str());
+        sendHTTP(fd, frame.data(), frame.size());
+        close(fd);
+    }
+
+    // /camera/stream
+    void handleCameraStream(int fd, const std::map<std::string,std::string>& params) {
+        std::string fmt = "mjpeg";
+        if (params.count("format")) fmt = params.at("format");
+        // Only support MJPEG for live stream in browser
+        std::ostringstream oss;
+        oss << "HTTP/1.1 200 OK\r\n"
+            << "Connection: close\r\n"
+            << "Cache-Control: no-cache\r\n"
+            << "Content-Type: multipart/x-mixed-replace; boundary=" << BOUNDARY << "\r\n"
+            << "\r\n";
+        sendHTTP(fd, oss.str());
+
+        {
+            std::lock_guard<std::mutex> lk(stream_clients_mutex);
+            stream_clients.emplace_back(fd, fmt);
+        }
+        // This thread will keep alive until client closes connection (handled in captureLoop)
+    }
+
+    void captureLoop() {
+        // Wait for /camera/start
+        while (running) {
+            {
+                std::unique_lock<std::mutex> lk(capture_mutex);
+                capture_cv.wait(lk, [this]{ return capture_on || !running; });
+                if (!running) return;
+            }
+            if (!camera.openDevice() || !camera.initDevice() || !camera.startCapture()) {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                continue;
+            }
+            while (capture_on && running) {
+                // Grab a frame
+                std::vector<uint8_t> frame;
+                std::string frame_fmt;
+                if (camera.readFrame(frame, &frame_fmt)) {
+                    // Update snapshot
+                    {
+                        std::lock_guard<std::mutex> lk(frame_mutex);
+                        last_frame = frame;
+                        last_frame_fmt = frame_fmt;
+                    }
+                    // MJPEG streaming
+                    std::lock_guard<std::mutex> lk(stream_clients_mutex);
+                    for (auto it = stream_clients.begin(); it != stream_clients.end();) {
+                        int fd = it->fd;
+                        std::ostringstream oss;
+                        oss << "--" << BOUNDARY << "\r\n"
+                            << "Content-Type: image/jpeg\r\n"
+                            << "Content-Length: " << frame.size() << "\r\n"
+                            << "\r\n";
+                        sendHTTP(fd, oss.str());
+                        sendHTTP(fd, frame.data(), frame.size());
+                        sendHTTP(fd, "\r\n");
+                        // Check if client is alive
+                        fd_set wfds;
+                        struct timeval tv;
+                        FD_ZERO(&wfds);
+                        FD_SET(fd, &wfds);
+                        tv.tv_sec = 0;
+                        tv.tv_usec = 0;
+                        int alive = select(fd+1, NULL, &wfds, NULL, &tv);
+                        if (alive < 0) {
+                            close(fd);
+                            it = stream_clients.erase(it);
+                        } else {
+                            ++it;
+                        }
+                    }
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(MJPEG_FRAME_TIMEOUT_MS));
+            }
+            camera.stopCapture();
+            camera.closeDevice();
+            // Disconnect stream clients if stopped
+            std::lock_guard<std::mutex> lk(stream_clients_mutex);
+            for (auto& c : stream_clients) {
+                close(c.fd);
+            }
+            stream_clients.clear();
+        }
+    }
 };
 
-std::vector<std::string> split(const std::string& s, char delimiter) {
-    std::vector<std::string> tokens;
-    std::string token;
-    std::istringstream tokenStream(s);
-    while (getline(tokenStream, token, delimiter)) {
-        tokens.push_back(token);
-    }
-    return tokens;
+int get_env_int(const char* name, int def) {
+    const char* v = std::getenv(name);
+    if (!v) return def;
+    try { return std::stoi(v); } catch (...) { return def; }
 }
 
-std::map<std::string, std::string> parseQuery(const std::string& query) {
-    std::map<std::string, std::string> params;
-    auto pairs = split(query, '&');
-    for (auto& p : pairs) {
-        auto kv = split(p, '=');
-        if (kv.size() == 2) params[kv[0]] = kv[1];
-    }
-    return params;
+std::string get_env_str(const char* name, const char* def) {
+    const char* v = std::getenv(name);
+    return v ? v : def;
 }
-
-HTTPServer::HTTPServer(USBCamera* cam, int port) : camera(cam), port(port), running(false) {}
-
-void HTTPServer::start() {
-    running = true;
-    int sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (sockfd < 0) { perror("socket"); exit(1); }
-
-    int enable = 1;
-    setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(int));
-
-    struct sockaddr_in serv_addr;
-    memset((char*)&serv_addr, 0, sizeof(serv_addr));
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_addr.s_addr = INADDR_ANY;
-    serv_addr.sin_port = htons(port);
-
-    if (bind(sockfd, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) { perror("bind"); exit(1); }
-    if (listen(sockfd, MAX_CLIENTS) < 0) { perror("listen"); exit(1); }
-
-    while (running) {
-        struct sockaddr_in cli_addr;
-        socklen_t clilen = sizeof(cli_addr);
-        int newsockfd = accept(sockfd, (struct sockaddr*)&cli_addr, &clilen);
-        if (newsockfd < 0) continue;
-        std::thread(&HTTPServer::handleClient, this, newsockfd).detach();
-    }
-    close(sockfd);
-}
-
-void HTTPServer::handleClient(int clientSock) {
-    char buffer[4096];
-    int n = read(clientSock, buffer, sizeof(buffer)-1);
-    if (n <= 0) { close(clientSock); return; }
-    buffer[n] = 0;
-    std::string req(buffer);
-
-    // Get request line
-    auto pos = req.find("\r\n");
-    if (pos == std::string::npos) { close(clientSock); return; }
-    auto req_line = req.substr(0, pos);
-    auto parts = split(req_line, ' ');
-    if (parts.size() < 2) { close(clientSock); return; }
-    std::string method = parts[0];
-    std::string path = parts[1];
-
-    // Parse path and query
-    std::string real_path = path;
-    std::string query_str;
-    auto qpos = path.find('?');
-    if (qpos != std::string::npos) {
-        real_path = path.substr(0, qpos);
-        query_str = path.substr(qpos+1);
-    }
-    auto query = parseQuery(query_str);
-
-    if (method == "GET" && real_path == "/camera/frame") {
-        sendSnapshot(clientSock, query);
-    } else if (method == "POST" && real_path == "/camera/start") {
-        sendStart(clientSock);
-    } else if (method == "POST" && real_path == "/camera/stop") {
-        sendStop(clientSock);
-    } else if (method == "GET" && real_path == "/camera/stream") {
-        streamMJPEG(clientSock, query);
-    } else {
-        sendNotFound(clientSock);
-        close(clientSock);
-    }
-}
-
-void HTTPServer::sendSnapshot(int clientSock, std::map<std::string, std::string>& query) {
-    int width = camera->defaultWidth;
-    int height = camera->defaultHeight;
-    std::string format = camera->defaultFormat;
-
-    if (query.count("resolution")) {
-        if (query["resolution"] == "HD") { width = 1280; height = 720; }
-        else if (query["resolution"] == "VGA") { width = 640; height = 480; }
-    }
-    if (query.count("format")) {
-        format = query["format"];
-    }
-
-    std::vector<unsigned char> frame;
-    std::string outFormat;
-    if (!camera->grabFrame(frame, outFormat, width, height, format)) {
-        std::string resp = "HTTP/1.1 503 Service Unavailable\r\n\r\n";
-        send(clientSock, resp.c_str(), resp.size(), 0);
-        close(clientSock);
-        return;
-    }
-
-    std::string contentType = (outFormat == "jpeg" || outFormat == "mjpeg") ? "image/jpeg" : "application/octet-stream";
-    std::ostringstream oss;
-    oss << "HTTP/1.1 200 OK\r\n";
-    oss << "Content-Type: " << contentType << "\r\n";
-    oss << "Content-Length: " << frame.size() << "\r\n";
-    oss << "Cache-Control: no-cache\r\n";
-    oss << "\r\n";
-    send(clientSock, oss.str().c_str(), oss.str().size(), 0);
-    send(clientSock, (const char*)frame.data(), frame.size(), 0);
-    close(clientSock);
-}
-
-void HTTPServer::streamMJPEG(int clientSock, std::map<std::string, std::string>& query) {
-    int width = camera->defaultWidth;
-    int height = camera->defaultHeight;
-    std::string format = "mjpeg";
-    if (query.count("resolution")) {
-        if (query["resolution"] == "HD") { width = 1280; height = 720; }
-        else if (query["resolution"] == "VGA") { width = 640; height = 480; }
-    }
-    if (query.count("format")) {
-        format = query["format"];
-    }
-
-    std::ostringstream oss;
-    oss << "HTTP/1.1 200 OK\r\n";
-    oss << "Cache-Control: no-cache\r\n";
-    oss << "Connection: close\r\n";
-    oss << "Content-Type: multipart/x-mixed-replace; boundary=" << BOUNDARY << "\r\n";
-    oss << "\r\n";
-    send(clientSock, oss.str().c_str(), oss.str().size(), 0);
-
-    // stream loop
-    while (camera->isCapturing()) {
-        std::vector<unsigned char> frame;
-        if (!camera->getLatestMJPEGFrame(frame)) { usleep(30000); continue; }
-        std::ostringstream head;
-        head << "--" << BOUNDARY << "\r\n";
-        head << "Content-Type: image/jpeg\r\n";
-        head << "Content-Length: " << frame.size() << "\r\n\r\n";
-        send(clientSock, head.str().c_str(), head.str().size(), 0);
-        send(clientSock, (const char*)frame.data(), frame.size(), 0);
-        send(clientSock, "\r\n", 2, 0);
-        usleep(50*1000); // 20fps
-    }
-    close(clientSock);
-}
-
-void HTTPServer::sendStart(int clientSock) {
-    if (camera->isCapturing()) {
-        std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"status\": \"already running\"}";
-        send(clientSock, resp.c_str(), resp.size(), 0);
-        close(clientSock);
-        return;
-    }
-    if (camera->startCapture()) {
-        std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"status\": \"started\"}";
-        send(clientSock, resp.c_str(), resp.size(), 0);
-    } else {
-        std::string resp = "HTTP/1.1 500 Internal Server Error\r\n\r\n";
-        send(clientSock, resp.c_str(), resp.size(), 0);
-    }
-    close(clientSock);
-}
-
-void HTTPServer::sendStop(int clientSock) {
-    if (!camera->isCapturing()) {
-        std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"status\": \"already stopped\"}";
-        send(clientSock, resp.c_str(), resp.size(), 0);
-        close(clientSock);
-        return;
-    }
-    if (camera->stopCapture()) {
-        std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"status\": \"stopped\"}";
-        send(clientSock, resp.c_str(), resp.size(), 0);
-    } else {
-        std::string resp = "HTTP/1.1 500 Internal Server Error\r\n\r\n";
-        send(clientSock, resp.c_str(), resp.size(), 0);
-    }
-    close(clientSock);
-}
-
-void HTTPServer::sendNotFound(int clientSock) {
-    std::string resp = "HTTP/1.1 404 Not Found\r\n\r\n";
-    send(clientSock, resp.c_str(), resp.size(), 0);
-}
-
-// MAIN
 
 int main() {
-    const char* dev = getenv("DEVICE_PATH");
-    if (!dev) dev = DEFAULT_VIDEO_DEVICE;
+    signal(SIGPIPE, SIG_IGN);
 
-    int port = DEFAULT_HTTP_PORT;
-    const char* port_env = getenv("HTTP_PORT");
-    if (port_env) port = atoi(port_env);
+    int http_port = get_env_int("HTTP_PORT", DEFAULT_HTTP_PORT);
+    std::string http_host = get_env_str("HTTP_HOST", DEFAULT_SERVER_HOST);
+    std::string video_dev = get_env_str("VIDEO_DEVICE", DEFAULT_VIDEO_DEVICE);
 
-    int width = DEFAULT_RESOLUTION_WIDTH;
-    int height = DEFAULT_RESOLUTION_HEIGHT;
-    const char* w_env = getenv("CAMERA_RESOLUTION_WIDTH");
-    const char* h_env = getenv("CAMERA_RESOLUTION_HEIGHT");
-    if (w_env) width = atoi(w_env);
-    if (h_env) height = atoi(h_env);
+    int width = get_env_int("CAMERA_WIDTH", 640);
+    int height = get_env_int("CAMERA_HEIGHT", 480);
+    std::string pixel_format = get_env_str("CAMERA_FORMAT", "mjpeg");
 
-    std::string format = "mjpeg";
-    const char* fmt_env = getenv("CAMERA_FORMAT");
-    if (fmt_env) format = fmt_env;
+    USBCamera camera(video_dev, width, height, pixel_format);
+    HTTPServer server(http_host, http_port, camera);
 
-    USBCamera camera;
-    if (!camera.openDevice(dev, width, height, format)) {
-        std::cerr << "Failed to open camera device " << dev << std::endl;
-        return 1;
-    }
-
-    HTTPServer server(&camera, port);
-
-    // Start capture by default
-    camera.startCapture();
-
-    std::cout << "USB Camera HTTP driver listening on port " << port << std::endl;
+    std::cout << "USB Camera HTTP Server started on " << http_host << ":" << http_port << std::endl;
     server.start();
 
     return 0;
