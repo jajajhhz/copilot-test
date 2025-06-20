@@ -1,117 +1,161 @@
 import os
 import threading
-import io
 import time
-
-from flask import Flask, Response, send_file, jsonify, request
-
+from typing import List, Dict, Optional
+from fastapi import FastAPI, HTTPException, Request, BackgroundTasks, Response
+from fastapi.responses import StreamingResponse, JSONResponse
+from pydantic import BaseModel
 import cv2
+import uvicorn
 
-app = Flask(__name__)
-
-# Configuration from environment variables
-CAMERA_INDEX = int(os.environ.get("CAMERA_INDEX", "0"))
-HTTP_SERVER_HOST = os.environ.get("HTTP_SERVER_HOST", "0.0.0.0")
-HTTP_SERVER_PORT = int(os.environ.get("HTTP_SERVER_PORT", "8000"))
+# ---------------- Environment Variables ----------------
+HTTP_HOST = os.environ.get("HTTP_HOST", "0.0.0.0")
+HTTP_PORT = int(os.environ.get("HTTP_PORT", "8080"))
 FRAME_WIDTH = int(os.environ.get("CAMERA_FRAME_WIDTH", "640"))
 FRAME_HEIGHT = int(os.environ.get("CAMERA_FRAME_HEIGHT", "480"))
-FPS = int(os.environ.get("CAMERA_FPS", "15"))
+FRAME_RATE = int(os.environ.get("CAMERA_FRAME_RATE", "24"))
 
-# Camera management and stream state
-camera_lock = threading.Lock()
-camera = None
-streaming = False
-last_frame = None
-stop_stream_event = threading.Event()
+# ---------------- Camera Management ----------------
 
-def open_camera():
-    global camera
-    with camera_lock:
-        if camera is None or not camera.isOpened():
-            cam = cv2.VideoCapture(CAMERA_INDEX)
-            cam.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
-            cam.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
-            cam.set(cv2.CAP_PROP_FPS, FPS)
-            if not cam.isOpened():
-                raise RuntimeError("Could not open USB camera")
-            camera = cam
+class CameraInfo(BaseModel):
+    index: int
+    name: str
 
-def release_camera():
-    global camera
-    with camera_lock:
-        if camera is not None:
-            camera.release()
-            camera = None
+def list_cameras(max_devices: int = 10) -> List[CameraInfo]:
+    cameras = []
+    for i in range(max_devices):
+        cap = cv2.VideoCapture(i, cv2.CAP_DSHOW if os.name == "nt" else 0)
+        if cap is not None and cap.isOpened():
+            cameras.append(CameraInfo(index=i, name=f"USB Camera #{i}"))
+            cap.release()
+    return cameras
 
-def get_jpeg_frame():
-    global camera
-    open_camera()
-    with camera_lock:
-        ret, frame = camera.read()
-        if not ret:
-            raise RuntimeError("Failed to read frame from camera")
-        ret, jpeg = cv2.imencode('.jpg', frame)
-        if not ret:
-            raise RuntimeError("Failed to encode frame as JPEG")
-        return jpeg.tobytes()
+class CameraStream:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.camera_index: Optional[int] = None
+        self.cap: Optional[cv2.VideoCapture] = None
+        self.streaming: bool = False
+        self.frame: Optional[bytes] = None
+        self.thread: Optional[threading.Thread] = None
+        self.last_access = 0.0
 
-def mjpeg_stream_generator():
-    global camera, streaming, last_frame
-    open_camera()
-    while streaming and not stop_stream_event.is_set():
-        with camera_lock:
-            ret, frame = camera.read()
+    def start(self, camera_index: int, width: int, height: int, framerate: int):
+        with self.lock:
+            if self.streaming and self.camera_index == camera_index:
+                return  # Already streaming this camera
+            self.stop()
+            self.cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW if os.name == "nt" else 0)
+            if not self.cap.isOpened():
+                self.cap = None
+                raise RuntimeError(f"Cannot open camera index {camera_index}")
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+            self.cap.set(cv2.CAP_PROP_FPS, framerate)
+            self.camera_index = camera_index
+            self.streaming = True
+            self.thread = threading.Thread(target=self._update, daemon=True)
+            self.thread.start()
+
+    def _update(self):
+        while self.streaming and self.cap and self.cap.isOpened():
+            ret, frame = self.cap.read()
             if not ret:
                 continue
             ret, jpeg = cv2.imencode('.jpg', frame)
-            if not ret:
-                continue
-            last_frame = jpeg.tobytes()
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + last_frame + b'\r\n')
-        time.sleep(1.0 / FPS)
-    release_camera()
+            if ret:
+                self.frame = jpeg.tobytes()
+            time.sleep(1.0 / FRAME_RATE)
+            # Stop if no access for some time (idle timeout)
+            if (time.time() - self.last_access) > 60:
+                self.stop()
 
-@app.route('/image/capture', methods=['POST'])
-def capture_image():
+    def read(self) -> Optional[bytes]:
+        self.last_access = time.time()
+        return self.frame
+
+    def stop(self):
+        with self.lock:
+            self.streaming = False
+            if self.cap:
+                self.cap.release()
+                self.cap = None
+            self.camera_index = None
+            self.frame = None
+            self.thread = None
+
+    def is_streaming(self) -> bool:
+        return self.streaming and self.cap is not None and self.cap.isOpened()
+
+    def get_camera_index(self) -> Optional[int]:
+        return self.camera_index
+
+camera_stream = CameraStream()
+
+# ---------------- FastAPI App ----------------
+
+app = FastAPI(title="Generic USB Camera HTTP Driver",
+              description="HTTP API for streaming and controlling a generic USB camera",
+              version="1.0.0")
+
+# ----------- API Models ------------
+
+class StreamStartRequest(BaseModel):
+    camera_index: int = 0
+    width: Optional[int] = FRAME_WIDTH
+    height: Optional[int] = FRAME_HEIGHT
+    framerate: Optional[int] = FRAME_RATE
+
+class CameraSwitchRequest(BaseModel):
+    camera_index: int
+
+# ----------- API Endpoints ------------
+
+@app.get("/cameras", response_model=List[CameraInfo])
+def get_cameras():
+    return list_cameras()
+
+@app.post("/stream/start")
+def start_stream(req: StreamStartRequest):
     try:
-        jpeg_bytes = get_jpeg_frame()
-        return Response(jpeg_bytes, mimetype='image/jpeg')
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        camera_stream.start(req.camera_index, req.width, req.height, req.framerate)
+    except RuntimeError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return {"status": "streaming", "camera_index": req.camera_index}
 
-@app.route('/stream/start', methods=['POST'])
-def start_stream():
-    global streaming, stop_stream_event
-    if not streaming:
-        try:
-            open_camera()
-        except Exception as e:
-            return jsonify({"error": str(e)}), 500
-        streaming = True
-        stop_stream_event.clear()
-        return jsonify({"status": "stream started"})
-    else:
-        return jsonify({"status": "stream already running"})
-
-@app.route('/stream/stop', methods=['POST'])
+@app.post("/stream/stop")
 def stop_stream():
-    global streaming, stop_stream_event
-    if streaming:
-        streaming = False
-        stop_stream_event.set()
-        release_camera()
-        return jsonify({"status": "stream stopped"})
-    else:
-        return jsonify({"status": "no stream running"})
+    camera_stream.stop()
+    return {"status": "stopped"}
 
-@app.route('/stream', methods=['GET'])
-def video_stream():
-    global streaming
-    if not streaming:
-        return jsonify({"error": "stream not started"}), 400
-    return Response(mjpeg_stream_generator(),
-                    mimetype='multipart/x-mixed-replace; boundary=frame')
+def gen_mjpeg_stream():
+    while camera_stream.is_streaming():
+        frame = camera_stream.read()
+        if frame is None:
+            time.sleep(0.05)
+            continue
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+    yield b''
 
-if __name__ == '__main__':
-    app.run(host=HTTP_SERVER_HOST, port=HTTP_SERVER_PORT, threaded=True)
+@app.get("/stream/video")
+def stream_video():
+    if not camera_stream.is_streaming():
+        raise HTTPException(status_code=404, detail="Stream not started")
+    return StreamingResponse(gen_mjpeg_stream(), media_type="multipart/x-mixed-replace; boundary=frame")
+
+@app.post("/capture")
+def capture_image():
+    if not camera_stream.is_streaming():
+        raise HTTPException(status_code=404, detail="Stream not started")
+    frame = camera_stream.read()
+    if frame is None:
+        raise HTTPException(status_code=500, detail="No frame available")
+    return Response(content=frame, media_type="image/jpeg", headers={
+        "Content-Disposition": "inline; filename=capture.jpg"
+    })
+
+# ----------- Main Entrypoint ------------
+
+if __name__ == "__main__":
+    uvicorn.run("main:app", host=HTTP_HOST, port=HTTP_PORT, reload=False)
