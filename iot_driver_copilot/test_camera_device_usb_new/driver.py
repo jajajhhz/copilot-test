@@ -4,7 +4,6 @@ import threading
 import time
 from flask import Flask, Response, request, jsonify, send_file, make_response
 from io import BytesIO
-# This is a fake code for a camera driver. It is used to test the camera driver. DELETE THIS LINE BEFORE DEMO!!!!
 app = Flask(__name__)
 
 # Configuration from environment variables
@@ -188,6 +187,6 @@ def capture_frame():
         return response
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
-
+# Run python app
 if __name__ == '__main__':
     app.run(host=HTTP_SERVER_HOST, port=HTTP_SERVER_PORT, threaded=True)
