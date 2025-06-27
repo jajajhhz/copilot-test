@@ -1,225 +1,166 @@
-const http = require('http');
-const fs = require('fs');
-const { spawn } = require('child_process');
-const os = require('os');
-const path = require('path');
-const { pipeline } = require('stream');
+const express = require('express');
+const { Readable } = require('stream');
+const NodeWebcam = require('node-webcam');
 
-// ==== CONFIGURATION FROM ENV ====
+// Configuration from environment variables
+const SERVER_HOST = process.env.SERVER_HOST || '0.0.0.0';
+const SERVER_PORT = parseInt(process.env.SERVER_PORT || '8080', 10);
+const CAMERA_DEVICE = process.env.CAMERA_DEVICE || null; // e.g., '/dev/video0'
+const CAMERA_WIDTH = parseInt(process.env.CAMERA_WIDTH || '640', 10);
+const CAMERA_HEIGHT = parseInt(process.env.CAMERA_HEIGHT || '480', 10);
+const CAMERA_FPS = parseInt(process.env.CAMERA_FPS || '10', 10);
+const CAMERA_MJPEG_QUALITY = parseInt(process.env.CAMERA_MJPEG_QUALITY || '80', 10);
 
-const SERVER_HOST = process.env.DEVICE_SHIFU_HTTP_HOST || '0.0.0.0';
-const SERVER_PORT = parseInt(process.env.DEVICE_SHIFU_HTTP_PORT || '8080', 10);
-const CAMERA_INDEX = parseInt(process.env.USB_CAMERA_INDEX || '0', 10);
-const CAMERA_RESOLUTION = process.env.USB_CAMERA_RESOLUTION || '640x480';
-const CAMERA_MANUFACTURER = process.env.USB_CAMERA_MANUFACTURER || 'Logitech';
-const CAMERA_MODEL = process.env.USB_CAMERA_MODEL || 'Unknown';
-const CAMERA_NAME = process.env.USB_CAMERA_NAME || 'USB Camera docker test';
-const FRAME_CAPTURE_FORMAT = process.env.USB_CAMERA_FRAME_FORMAT || 'mjpeg'; // can be changed to jpeg, png, etc.
-
-let currentCameraIndex = CAMERA_INDEX;
+// State
 let isStreaming = false;
-let ffmpegProcess = null;
 let streamClients = [];
-let streamMimeType = 'multipart/x-mixed-replace; boundary=frame';
+let streamInterval = null;
+let selectedCamera = CAMERA_DEVICE;
 
-// ==== DEVICE ENUMERATION (LINUX ONLY) ====
+const app = express();
+app.use(express.json());
 
-function listVideoDevices() {
-    const videoDevices = [];
-    const devDir = '/dev';
-    try {
-        const files = fs.readdirSync(devDir);
-        files.forEach(file => {
-            if (file.startsWith('video')) {
-                videoDevices.push(path.join(devDir, file));
-            }
-        });
-    } catch (err) {}
-    return videoDevices;
+// Camera options
+function getWebcamOpts() {
+  return {
+    width: CAMERA_WIDTH,
+    height: CAMERA_HEIGHT,
+    quality: CAMERA_MJPEG_QUALITY,
+    device: selectedCamera,
+    fps: CAMERA_FPS,
+    saveShots: false,
+    output: "jpeg",
+    callbackReturn: "buffer",
+    verbose: false
+  };
 }
 
-function getCurrentDevice() {
-    const devices = listVideoDevices();
-    return devices[currentCameraIndex] || null;
+// List available cameras using node-webcam
+function listAvailableCameras(cb) {
+  NodeWebcam.list(cb);
 }
 
-// ==== STREAMING & CONTROL LOGIC ====
-
-function startCameraStream() {
-    if (isStreaming || ffmpegProcess) return;
-    const device = getCurrentDevice();
-    if (!device) throw new Error('No camera device found');
-    // Use ffmpeg to read from the USB camera and output MJPEG frames to stdout
-    // No third-party process execution *from* the driver; however, ffmpeg as a local binary is allowed if present (see requirements).
-    // If not, can fallback to v4l2-ctl or pure node implementation, but no reliable pure-node MJPEG streamer.
-    // We'll use ffmpeg as a subprocess, but not as a shell command!
-    // FFMPEG must be available in the image.
-    // Args: overwrite to MJPEG for browser compatibility
-    const [width, height] = CAMERA_RESOLUTION.split('x');
-    const args = [
-        '-f', 'video4linux2',
-        '-input_format', 'mjpeg',
-        '-video_size', `${width}x${height}`,
-        '-i', device,
-        '-f', 'mjpeg',
-        '-q:v', '5',
-        '-'
-    ];
-    ffmpegProcess = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'ignore'] });
-    isStreaming = true;
-
-    ffmpegProcess.stdout.on('data', (chunk) => {
-        for (let res of streamClients) {
-            // MJPEG streaming: write multipart frame
-            res.write(`--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ${chunk.length}\r\n\r\n`);
-            res.write(chunk);
-            res.write('\r\n');
-        }
+// Start streaming
+function startStream() {
+  if (isStreaming) return;
+  isStreaming = true;
+  streamInterval = setInterval(() => {
+    if (streamClients.length === 0) return;
+    NodeWebcam.capture("stream_frame", getWebcamOpts(), function(err, frameBuffer) {
+      if (err || !frameBuffer) return;
+      // Write MJPEG frame to all clients
+      const header = `--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ${frameBuffer.length}\r\n\r\n`;
+      streamClients.forEach(res => {
+        res.write(header);
+        res.write(frameBuffer);
+        res.write('\r\n');
+      });
     });
+  }, 1000 / CAMERA_FPS);
+}
 
-    ffmpegProcess.on('exit', () => {
-        isStreaming = false;
-        ffmpegProcess = null;
-        for (let res of streamClients) {
-            if (!res.finished) res.end();
-        }
-        streamClients = [];
+// Stop streaming
+function stopStream() {
+  isStreaming = false;
+  if (streamInterval) {
+    clearInterval(streamInterval);
+    streamInterval = null;
+  }
+  streamClients.forEach(res => {
+    try { res.end(); } catch (e) {}
+  });
+  streamClients = [];
+}
+
+// GET /camera/info
+app.get('/camera/info', (req, res) => {
+  res.json({
+    device_name: "USB Camera docker test",
+    device_model: "Unknown",
+    manufacturer: "Logitech",
+    device_type: "Camera",
+    resolution: `${CAMERA_WIDTH}x${CAMERA_HEIGHT}`,
+    camera_device: selectedCamera
+  });
+});
+
+// POST /camera/start
+app.post('/camera/start', (req, res) => {
+  if (!isStreaming) {
+    startStream();
+  }
+  res.status(200).json({ status: "streaming_started" });
+});
+
+// POST /camera/stop
+app.post('/camera/stop', (req, res) => {
+  stopStream();
+  res.status(200).json({ status: "streaming_stopped" });
+});
+
+// GET /camera/stream - MJPEG multipart stream
+app.get('/camera/stream', (req, res) => {
+  res.writeHead(200, {
+    'Content-Type': 'multipart/x-mixed-replace; boundary=frame',
+    'Cache-Control': 'no-cache',
+    'Connection': 'close',
+    'Pragma': 'no-cache'
+  });
+  streamClients.push(res);
+
+  req.on('close', () => {
+    streamClients = streamClients.filter(c => c !== res);
+    if (streamClients.length === 0) {
+      stopStream();
+    }
+  });
+
+  // Auto-start stream if not running
+  if (!isStreaming) {
+    startStream();
+  }
+});
+
+// GET /camera/captureframe - Returns a single JPEG image
+app.get('/camera/captureframe', (req, res) => {
+  NodeWebcam.capture("capture_frame", getWebcamOpts(), function(err, frameBuffer) {
+    if (err || !frameBuffer) {
+      res.status(500).json({ error: "Failed to capture frame" });
+      return;
+    }
+    res.writeHead(200, {
+      'Content-Type': 'image/jpeg',
+      'Content-Length': frameBuffer.length
     });
-}
+    res.end(frameBuffer);
+  });
+});
 
-function stopCameraStream() {
-    if (ffmpegProcess) {
-        ffmpegProcess.kill('SIGTERM');
-        ffmpegProcess = null;
+// POST /camera/switch - Switch to another camera device
+app.post('/camera/switch', (req, res) => {
+  let { device } = req.body;
+  if (!device) {
+    res.status(400).json({ error: "Missing 'device' in body" });
+    return;
+  }
+  listAvailableCameras(function(list) {
+    if (!list || !list.includes(device)) {
+      res.status(404).json({ error: "Device not found" });
+      return;
     }
-    isStreaming = false;
-}
+    selectedCamera = device;
+    stopStream();
+    res.status(200).json({ status: "switched", device });
+  });
+});
 
-// ==== HTTP ROUTES ====
+// GET /camera/list - List available camera devices
+app.get('/camera/list', (req, res) => {
+  listAvailableCameras(function(list) {
+    res.status(200).json({ devices: list });
+  });
+});
 
-function route(req, res) {
-    if (req.method === 'GET' && req.url === '/camera/stream') {
-        // Start streaming if not already started
-        try {
-            if (!isStreaming) {
-                startCameraStream();
-            }
-        } catch (err) {
-            res.writeHead(500);
-            res.end('Failed to start camera stream: ' + err.message);
-            return;
-        }
-        res.writeHead(200, {
-            'Content-Type': streamMimeType,
-            'Cache-Control': 'no-cache',
-            'Connection': 'close',
-            'Pragma': 'no-cache'
-        });
-        streamClients.push(res);
-
-        req.on('close', () => {
-            streamClients = streamClients.filter(r => r !== res);
-            if (streamClients.length === 0) {
-                stopCameraStream();
-            }
-        });
-    }
-    else if (req.method === 'POST' && req.url === '/camera/stop') {
-        stopCameraStream();
-        res.writeHead(200, {'Content-Type': 'application/json'});
-        res.end(JSON.stringify({ status: 'stopped' }));
-    }
-    else if (req.method === 'POST' && req.url === '/camera/start') {
-        try {
-            if (!isStreaming) {
-                startCameraStream();
-            }
-            res.writeHead(200, {'Content-Type': 'application/json'});
-            res.end(JSON.stringify({ status: 'started' }));
-        } catch (err) {
-            res.writeHead(500);
-            res.end(JSON.stringify({ error: err.message }));
-        }
-    }
-    else if (req.method === 'GET' && req.url === '/camera/info') {
-        const device = getCurrentDevice();
-        res.writeHead(200, {'Content-Type': 'application/json'});
-        res.end(JSON.stringify({
-            device_name: CAMERA_NAME,
-            device_model: CAMERA_MODEL,
-            manufacturer: CAMERA_MANUFACTURER,
-            device_type: 'Camera',
-            current_device: device,
-            resolution: CAMERA_RESOLUTION,
-            camera_index: currentCameraIndex,
-            available_devices: listVideoDevices()
-        }));
-    }
-    else if (req.method === 'GET' && req.url.startsWith('/camera/captureframe')) {
-        // Capture a single frame as jpeg and send
-        const device = getCurrentDevice();
-        if (!device) {
-            res.writeHead(404);
-            res.end('Camera device not found');
-            return;
-        }
-        const [width, height] = CAMERA_RESOLUTION.split('x');
-        const args = [
-            '-f', 'video4linux2',
-            '-input_format', 'mjpeg',
-            '-video_size', `${width}x${height}`,
-            '-i', device,
-            '-vframes', '1',
-            '-f', 'image2',
-            '-q:v', '2',
-            '-'
-        ];
-        const ff = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'ignore'] });
-        res.writeHead(200, {'Content-Type': 'image/jpeg'});
-        pipeline(ff.stdout, res, (err) => {
-            if (err && !res.headersSent) {
-                res.writeHead(500);
-                res.end();
-            }
-        });
-        ff.on('exit', () => {
-            if (!res.finished) res.end();
-        });
-    }
-    else if (req.method === 'POST' && req.url.startsWith('/camera/switch')) {
-        // Switch camera endpoint: expects JSON { "index": <number> }
-        let body = '';
-        req.on('data', chunk => body += chunk);
-        req.on('end', () => {
-            try {
-                const data = JSON.parse(body);
-                const idx = parseInt(data.index, 10);
-                const devices = listVideoDevices();
-                if (!isFinite(idx) || idx < 0 || idx >= devices.length) {
-                    res.writeHead(400, {'Content-Type': 'application/json'});
-                    res.end(JSON.stringify({error: 'Invalid camera index'}));
-                    return;
-                }
-                currentCameraIndex = idx;
-                stopCameraStream();
-                res.writeHead(200, {'Content-Type': 'application/json'});
-                res.end(JSON.stringify({status: 'switched', camera_index: idx, device: devices[idx]}));
-            } catch (err) {
-                res.writeHead(400, {'Content-Type': 'application/json'});
-                res.end(JSON.stringify({error: 'Malformed request'}));
-            }
-        });
-    }
-    else {
-        res.writeHead(404, {'Content-Type': 'application/json'});
-        res.end(JSON.stringify({error: 'Not found'}));
-    }
-}
-
-// ==== SERVER STARTUP ====
-
-const server = http.createServer(route);
-
-server.listen(SERVER_PORT, SERVER_HOST, () => {
-    console.log(`USB Camera HTTP Driver running at http://${SERVER_HOST}:${SERVER_PORT}/`);
+app.listen(SERVER_PORT, SERVER_HOST, () => {
+  console.log(`Camera driver listening at http://${SERVER_HOST}:${SERVER_PORT}`);
 });
