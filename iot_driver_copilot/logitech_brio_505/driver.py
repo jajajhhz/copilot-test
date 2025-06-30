@@ -4,12 +4,11 @@ import threading
 import time
 from flask import Flask, Response, request, jsonify, send_file, make_response
 from io import BytesIO
-
 app = Flask(__name__)
 
 # Configuration from environment variables
 HTTP_SERVER_HOST = os.environ.get('HTTP_SERVER_HOST', '0.0.0.0')
-HTTP_SERVER_PORT = int(os.environ.get('HTTP_SERVER_PORT', '8080'))
+HTTP_SERVER_PORT = int(os.environ.get('HTTP_SERVER_PORT', '5000'))
 
 DEFAULT_WIDTH = int(os.environ.get('CAMERA_DEFAULT_WIDTH', '640'))
 DEFAULT_HEIGHT = int(os.environ.get('CAMERA_DEFAULT_HEIGHT', '480'))
@@ -138,8 +137,12 @@ def gen_frames(camera_id):
         if not ret:
             continue
         jpg_bytes = buffer.tobytes()
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + jpg_bytes + b'\r\n')
+        yield (b'--frame
+'
+               b'Content-Type: image/jpeg
+
+' + jpg_bytes + b'
+')
         time.sleep(1.0 / cam.fps if cam.fps > 0 else 0.03)
 
 @app.route('/camera/stream', methods=['GET'])
@@ -184,6 +187,6 @@ def capture_frame():
         return response
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
-
+# Run python app
 if __name__ == '__main__':
     app.run(host=HTTP_SERVER_HOST, port=HTTP_SERVER_PORT, threaded=True)
