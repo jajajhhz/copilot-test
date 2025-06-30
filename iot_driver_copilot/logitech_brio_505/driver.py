@@ -137,11 +137,8 @@ def gen_frames(camera_id):
         if not ret:
             continue
         jpg_bytes = buffer.tobytes()
-        yield (b'--frame
-'  b'Content-Type: image/jpeg
-
-' + jpg_bytes + b'
-')
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + jpg_bytes + b'\r\n')
         time.sleep(1.0 / cam.fps if cam.fps > 0 else 0.03)
 
 @app.route('/camera/stream', methods=['GET'])
