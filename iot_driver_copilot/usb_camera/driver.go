@@ -1,15 +1,13 @@
-```go
 package main
 
 import (
-	"bytes"
-	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"image"
 	"image/jpeg"
-	"io"
 	"log"
+	"mime"
 	"net/http"
 	"os"
 	"strconv"
@@ -17,379 +15,352 @@ import (
 	"sync"
 	"time"
 
-	"github.com/blackjack/webcam"
-)
-
-type VideoFormat string
-
-const (
-	FormatMJPEG VideoFormat = "MJPEG"
-	FormatYUYV  VideoFormat = "YUYV"
+	"golang.org/x/sync/errgroup"
+	"gocv.io/x/gocv"
 )
 
 type VideoState struct {
-	mu       sync.Mutex
-	running  bool
-	format   VideoFormat
-	width    uint32
-	height   uint32
-	fps      float64
-	cancel   context.CancelFunc
+	mu             sync.RWMutex
+	capturing      bool
+	streamFormat   string
+	width, height  int
+	fps            int
+	deviceID       int
+	videoCapture   *gocv.VideoCapture
+	stopCh         chan struct{}
+	activeClients  int
 }
 
-var videoState = &VideoState{}
+var state = &VideoState{
+	capturing:    false,
+	streamFormat: "mjpeg",
+	width:        640,
+	height:       480,
+	fps:          15,
+	deviceID:     0,
+	stopCh:       nil,
+}
 
-func getEnv(key, fallback string) string {
-	if val := os.Getenv(key); val != "" {
-		return val
+type StartCaptureRequest struct {
+	Format   string `json:"format"`
+	Width    int    `json:"width"`
+	Height   int    `json:"height"`
+	FPS      int    `json:"fps"`
+	DeviceID int    `json:"device_id"`
+}
+
+func envInt(key string, def int) int {
+	val := os.Getenv(key)
+	if val == "" {
+		return def
 	}
-	return fallback
-}
-
-func parseUint32(s string, fallback uint32) uint32 {
-	if v, err := strconv.ParseUint(s, 10, 32); err == nil {
-		return uint32(v)
+	i, err := strconv.Atoi(val)
+	if err != nil {
+		return def
 	}
-	return fallback
+	return i
 }
-
-func parseFloat64(s string, fallback float64) float64 {
-	if v, err := strconv.ParseFloat(s, 64); err == nil {
-		return v
+func envString(key, def string) string {
+	val := os.Getenv(key)
+	if val == "" {
+		return def
 	}
-	return fallback
+	return val
 }
 
-func getVideoFormat(f string) VideoFormat {
-	switch strings.ToUpper(f) {
-	case "MJPEG":
-		return FormatMJPEG
-	case "YUYV":
-		return FormatYUYV
-	default:
-		return FormatMJPEG
+// Open camera with current state configuration
+func (v *VideoState) openCamera() error {
+	if v.videoCapture != nil {
+		return nil
 	}
-}
-
-func getSupportedFormat(cam *webcam.Webcam, format VideoFormat) (webcam.PixelFormat, error) {
-	formats := cam.GetSupportedFormats()
-	for pf, desc := range formats {
-		if (format == FormatMJPEG && strings.Contains(strings.ToUpper(desc), "MJPEG")) ||
-			(format == FormatYUYV && strings.Contains(strings.ToUpper(desc), "YUYV")) {
-			return pf, nil
+	cam, err := gocv.OpenVideoCapture(v.deviceID)
+	if err != nil {
+		return err
+	}
+	if ok := cam.Set(gocv.VideoCaptureFrameWidth, float64(v.width)); !ok {
+		// continue
+	}
+	if ok := cam.Set(gocv.VideoCaptureFrameHeight, float64(v.height)); !ok {
+		// continue
+	}
+	if v.fps > 0 {
+		if ok := cam.Set(gocv.VideoCaptureFPS, float64(v.fps)); !ok {
+			// continue
 		}
 	}
-	return 0, errors.New("requested format not supported by camera")
+	v.videoCapture = cam
+	return nil
 }
 
-func getSupportedFrameSize(cam *webcam.Webcam, pf webcam.PixelFormat, width, height uint32) (webcam.FrameSize, error) {
-	frames := cam.GetSupportedFrameSizes(pf)
-	var best webcam.FrameSize
-	bestDiff := uint32(0xFFFFFFFF)
-	for _, f := range frames {
-		diff := absDiff(f.MaxWidth, width) + absDiff(f.MaxHeight, height)
-		if diff < bestDiff {
-			bestDiff = diff
-			best = f
-		}
+func (v *VideoState) closeCamera() {
+	if v.videoCapture != nil {
+		v.videoCapture.Close()
+		v.videoCapture = nil
 	}
-	if best.MaxWidth == 0 || best.MaxHeight == 0 {
-		return webcam.FrameSize{}, errors.New("no valid frame size found")
-	}
-	return best, nil
 }
 
-func absDiff(a, b uint32) uint32 {
-	if a > b {
-		return a - b
-	}
-	return b - a
-}
+// /video/start and /capture/start: POST
+func startCaptureHandler(w http.ResponseWriter, r *http.Request) {
+	state.mu.Lock()
+	defer state.mu.Unlock()
 
-func openCamera(dev string, format VideoFormat, width, height uint32, fps float64) (*webcam.Webcam, webcam.PixelFormat, error) {
-	cam, err := webcam.Open(dev)
-	if err != nil {
-		return nil, 0, err
-	}
-
-	pf, err := getSupportedFormat(cam, format)
-	if err != nil {
-		cam.Close()
-		return nil, 0, err
-	}
-
-	fs, err := getSupportedFrameSize(cam, pf, width, height)
-	if err != nil {
-		cam.Close()
-		return nil, 0, err
-	}
-
-	// FPS: try to set closest supported
-	intervals := cam.GetSupportedFrameIntervals(pf, fs)
-	bestInterval := intervals[0]
-	bestDiff := absDiff(uint32(float64(1e6)/float64(bestInterval.Numerator)/float64(bestInterval.Denominator)), uint32(fps))
-	for _, i := range intervals {
-		ival := float64(i.Denominator) / float64(i.Numerator)
-		diff := absDiff(uint32(ival*1000), uint32(1000/fps))
-		if diff < bestDiff {
-			bestDiff = diff
-			bestInterval = i
-		}
-	}
-
-	_, _, _, err = cam.SetImageFormat(pf, fs.MaxWidth, fs.MaxHeight)
-	if err != nil {
-		cam.Close()
-		return nil, 0, err
-	}
-	if err := cam.StartStreaming(); err != nil {
-		cam.Close()
-		return nil, 0, err
-	}
-	return cam, pf, nil
-}
-
-// API Handlers
-
-func handleVideoStart(w http.ResponseWriter, r *http.Request) {
-	format := getVideoFormat(r.URL.Query().Get("format"))
-	width := parseUint32(r.URL.Query().Get("width"), parseUint32(getEnv("CAMERA_WIDTH", "640"), 640))
-	height := parseUint32(r.URL.Query().Get("height"), parseUint32(getEnv("CAMERA_HEIGHT", "480"), 480))
-	fps := parseFloat64(r.URL.Query().Get("fps"), parseFloat64(getEnv("CAMERA_FPS", "15"), 15))
-
-	videoState.mu.Lock()
-	defer videoState.mu.Unlock()
-	if videoState.running {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "already running"})
-		return
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	videoState.running = true
-	videoState.format = format
-	videoState.width = width
-	videoState.height = height
-	videoState.fps = fps
-	videoState.cancel = cancel
-	writeJSON(w, http.StatusOK, map[string]string{"status": "started"})
-	go func() {
-		<-ctx.Done()
-	}()
-}
-
-func handleVideoStop(w http.ResponseWriter, r *http.Request) {
-	videoState.mu.Lock()
-	defer videoState.mu.Unlock()
-	if !videoState.running {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "already stopped"})
-		return
-	}
-	if videoState.cancel != nil {
-		videoState.cancel()
-	}
-	videoState.running = false
-	videoState.cancel = nil
-	writeJSON(w, http.StatusOK, map[string]string{"status": "stopped"})
-}
-
-func handleCaptureStart(w http.ResponseWriter, r *http.Request) {
-	handleVideoStart(w, r)
-}
-
-func handleCaptureStop(w http.ResponseWriter, r *http.Request) {
-	handleVideoStop(w, r)
-}
-
-// /video/stream and /stream
-func handleStream(w http.ResponseWriter, r *http.Request) {
-	videoState.mu.Lock()
-	running := videoState.running
-	format := videoState.format
-	width := videoState.width
-	height := videoState.height
-	fps := videoState.fps
-	videoState.mu.Unlock()
-
-	if !running {
-		http.Error(w, "video is not running, start video first", http.StatusBadRequest)
+	if state.capturing {
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "already capturing",
+			"format":  state.streamFormat,
+			"width":   state.width,
+			"height":  state.height,
+			"fps":     state.fps,
+			"device":  state.deviceID,
+		})
 		return
 	}
 
-	devicePath := getEnv("CAMERA_DEVICE", "/dev/video0")
-	cam, pf, err := openCamera(devicePath, format, width, height, fps)
-	if err != nil {
-		http.Error(w, "failed to open camera: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	defer cam.Close()
-
-	if pf == webcam.PixelFormat(1196444237) { // MJPG fourcc
-		w.Header().Set("Content-Type", "multipart/x-mixed-replace; boundary=frame")
-		streamMJPEG(cam, w)
+	req := StartCaptureRequest{}
+	if r.Header.Get("Content-Type") == "application/json" {
+		json.NewDecoder(r.Body).Decode(&req)
 	} else {
-		w.Header().Set("Content-Type", "multipart/x-mixed-replace; boundary=frame")
-		streamYUYVasMJPEG(cam, width, height, w)
+		r.ParseForm()
+		req.Format = r.FormValue("format")
+		req.Width, _ = strconv.Atoi(r.FormValue("width"))
+		req.Height, _ = strconv.Atoi(r.FormValue("height"))
+		req.FPS, _ = strconv.Atoi(r.FormValue("fps"))
+		req.DeviceID, _ = strconv.Atoi(r.FormValue("device_id"))
 	}
+	if req.Format != "" {
+		state.streamFormat = strings.ToLower(req.Format)
+	}
+	if req.Width > 0 {
+		state.width = req.Width
+	}
+	if req.Height > 0 {
+		state.height = req.Height
+	}
+	if req.FPS > 0 {
+		state.fps = req.FPS
+	}
+	if req.DeviceID >= 0 {
+		state.deviceID = req.DeviceID
+	}
+
+	state.stopCh = make(chan struct{})
+	if err := state.openCamera(); err != nil {
+		state.capturing = false
+		state.closeCamera()
+		http.Error(w, "Failed to open camera: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	state.capturing = true
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":  "started",
+		"format":  state.streamFormat,
+		"width":   state.width,
+		"height":  state.height,
+		"fps":     state.fps,
+		"device":  state.deviceID,
+	})
 }
 
-func streamMJPEG(cam *webcam.Webcam, w http.ResponseWriter) {
+// /video/stop and /capture/stop: POST
+func stopCaptureHandler(w http.ResponseWriter, r *http.Request) {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if !state.capturing {
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status": "not capturing",
+		})
+		return
+	}
+	close(state.stopCh)
+	state.capturing = false
+	state.closeCamera()
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status": "stopped",
+	})
+}
+
+// Helper for MJPEG streaming
+func streamMJPEG(w http.ResponseWriter, r *http.Request, width, height, fps int) error {
+	boundary := "MJPEGBOUNDARY"
+	w.Header().Set("Content-Type", "multipart/x-mixed-replace; boundary="+boundary)
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "close")
+
+	img := gocv.NewMat()
+	defer img.Close()
+
+	state.mu.Lock()
+	err := state.openCamera()
+	if err != nil {
+		state.mu.Unlock()
+		return errors.New("camera open failed: " + err.Error())
+	}
+	state.mu.Unlock()
+
+	interval := time.Second / time.Duration(fps)
 	for {
-		err := cam.WaitForFrame(5)
-		switch err.(type) {
-		case nil:
-			frame, err := cam.ReadFrame()
-			if err != nil {
-				continue
-			}
-			if len(frame) == 0 {
-				continue
-			}
-			w.Write([]byte("--frame\r\nContent-Type: image/jpeg\r\n\r\n"))
-			w.Write(frame)
-			w.Write([]byte("\r\n"))
-			if f, ok := w.(http.Flusher); ok {
-				f.Flush()
-			}
-		case *webcam.Timeout:
-			continue
+		state.mu.RLock()
+		capturing := state.capturing
+		stopCh := state.stopCh
+		state.mu.RUnlock()
+
+		if !capturing {
+			break
+		}
+
+		select {
+		case <-stopCh:
+			return nil
 		default:
-			return
+		}
+
+		if ok := state.videoCapture.Read(&img); !ok {
+			continue
+		}
+		if img.Empty() {
+			continue
+		}
+		buf, err := gocv.IMEncode(".jpg", img)
+		if err != nil || len(buf) == 0 {
+			continue
+		}
+
+		fmt.Fprintf(w, "--%s\r\n", boundary)
+		fmt.Fprintf(w, "Content-Type: image/jpeg\r\n")
+		fmt.Fprintf(w, "Content-Length: %d\r\n\r\n", len(buf))
+		w.Write(buf)
+		fmt.Fprintf(w, "\r\n")
+		w.(http.Flusher).Flush()
+
+		time.Sleep(interval)
+	}
+	return nil
+}
+
+// /video/stream and /stream: GET
+func streamHandler(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	format := strings.ToLower(q.Get("format"))
+	if format == "" {
+		format = state.streamFormat
+	}
+	width := state.width
+	height := state.height
+	fps := state.fps
+
+	if v := q.Get("width"); v != "" {
+		if i, err := strconv.Atoi(v); err == nil && i > 0 {
+			width = i
 		}
 	}
-}
-
-// YUYV to JPEG
-func streamYUYVasMJPEG(cam *webcam.Webcam, width, height uint32, w http.ResponseWriter) {
-	for {
-		err := cam.WaitForFrame(5)
-		switch err.(type) {
-		case nil:
-			frame, err := cam.ReadFrame()
-			if err != nil {
-				continue
-			}
-			if len(frame) == 0 {
-				continue
-			}
-			img := yuyvToImage(frame, int(width), int(height))
-			buf := new(bytes.Buffer)
-			jpeg.Encode(buf, img, nil)
-			w.Write([]byte("--frame\r\nContent-Type: image/jpeg\r\n\r\n"))
-			w.Write(buf.Bytes())
-			w.Write([]byte("\r\n"))
-			if f, ok := w.(http.Flusher); ok {
-				f.Flush()
-			}
-		case *webcam.Timeout:
-			continue
-		default:
-			return
+	if v := q.Get("height"); v != "" {
+		if i, err := strconv.Atoi(v); err == nil && i > 0 {
+			height = i
 		}
 	}
-}
-
-// Convert YUYV (YUV422) to image.Image
-func yuyvToImage(in []byte, width, height int) image.Image {
-	img := image.NewRGBA(image.Rect(0, 0, width, height))
-	for i, j := 0, 0; i+3 < len(in) && j+1 < width*height; i, j = i+4, j+2 {
-		y0 := in[i+0]
-		u := in[i+1]
-		y1 := in[i+2]
-		v := in[i+3]
-		img.Set(j%width, j/width, yuvToRGB(y0, u, v))
-		img.Set((j+1)%width, (j+1)/width, yuvToRGB(y1, u, v))
+	if v := q.Get("fps"); v != "" {
+		if i, err := strconv.Atoi(v); err == nil && i > 0 {
+			fps = i
+		}
 	}
-	return img
-}
 
-// YUV to RGBA
-func yuvToRGB(y, u, v byte) image.Color {
-	c := int(y) - 16
-	d := int(u) - 128
-	e := int(v) - 128
-
-	r := clip((298*c + 409*e + 128) >> 8)
-	g := clip((298*c - 100*d - 208*e + 128) >> 8)
-	b := clip((298*c + 516*d + 128) >> 8)
-	return image.RGBAColor{uint8(r), uint8(g), uint8(b), 255}
-}
-
-func clip(x int) int {
-	if x < 0 {
-		return 0
+	state.mu.Lock()
+	if !state.capturing {
+		state.mu.Unlock()
+		http.Error(w, "Video capture not started", http.StatusServiceUnavailable)
+		return
 	}
-	if x > 255 {
-		return 255
+	state.activeClients++
+	state.mu.Unlock()
+
+	defer func() {
+		state.mu.Lock()
+		state.activeClients--
+		state.mu.Unlock()
+	}()
+
+	if format == "mjpeg" || format == "" {
+		err := streamMJPEG(w, r, width, height, fps)
+		if err != nil {
+			http.Error(w, "MJPEG streaming error: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+	} else {
+		http.Error(w, "unsupported stream format: "+format, http.StatusBadRequest)
 	}
-	return x
 }
 
-func writeJSON(w http.ResponseWriter, code int, data interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code)
-	json.NewEncoder(w).Encode(data)
+// Helper for liveness/readiness
+func pingHandler(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("OK"))
 }
 
+// API/route mapping
 func main() {
-	addr := getEnv("HTTP_SERVER_HOST", "") + ":" + getEnv("HTTP_SERVER_PORT", "8080")
+	state.width = envInt("CAMERA_WIDTH", 640)
+	state.height = envInt("CAMERA_HEIGHT", 480)
+	state.fps = envInt("CAMERA_FPS", 15)
+	state.deviceID = envInt("CAMERA_DEVICE_ID", 0)
+	state.streamFormat = strings.ToLower(envString("CAMERA_FORMAT", "mjpeg"))
+
+	host := envString("SERVER_HOST", "0.0.0.0")
+	port := envInt("SERVER_PORT", 8080)
 
 	http.HandleFunc("/video/start", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		if r.Method == http.MethodPost {
+			startCaptureHandler(w, r)
 			return
 		}
-		handleVideoStart(w, r)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	})
-
-	http.HandleFunc("/video/stop", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		handleVideoStop(w, r)
-	})
-
 	http.HandleFunc("/capture/start", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		if r.Method == http.MethodPost {
+			startCaptureHandler(w, r)
 			return
 		}
-		handleCaptureStart(w, r)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	})
-
-	http.HandleFunc("/capture/stop", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	http.HandleFunc("/video/stop", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			stopCaptureHandler(w, r)
 			return
 		}
-		handleCaptureStop(w, r)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	})
+	http.HandleFunc("/capture/stop", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			stopCaptureHandler(w, r)
+			return
+		}
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	})
 
 	http.HandleFunc("/video/stream", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		if r.Method == http.MethodGet {
+			streamHandler(w, r)
 			return
 		}
-		handleStream(w, r)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	})
-
 	http.HandleFunc("/stream", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		if r.Method == http.MethodGet {
+			streamHandler(w, r)
 			return
 		}
-		handleStream(w, r)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	})
 
-	log.Printf("Starting USB Camera HTTP driver server at %s", addr)
+	http.HandleFunc("/ping", pingHandler)
+	http.HandleFunc("/healthz", pingHandler)
+
+	addr := fmt.Sprintf("%s:%d", host, port)
+	log.Printf("USB Camera HTTP server listening on %s\n", addr)
 	if err := http.ListenAndServe(addr, nil); err != nil {
-		log.Fatalf("failed to start server: %v", err)
+		log.Fatal(err)
 	}
 }
-```
-**Note:**  
-- Requires the [github.com/blackjack/webcam](https://github.com/blackjack/webcam) Go package for V4L2 camera access.
-- Configurable via environment variables:
-  - `HTTP_SERVER_HOST`, `HTTP_SERVER_PORT` (HTTP server bind address/port)
-  - `CAMERA_DEVICE` (default `/dev/video0`)
-  - `CAMERA_WIDTH`/`CAMERA_HEIGHT`/`CAMERA_FPS` (defaults: 640/480/15)
-- All endpoints are available as described and stream via HTTP (MJPEG), accessible in browser or command-line tools like `curl`.
