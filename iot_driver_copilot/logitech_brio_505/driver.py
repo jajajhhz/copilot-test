@@ -138,7 +138,7 @@ def gen_frames(camera_id):
             continue
         jpg_bytes = buffer.tobytes()
         yield (b'--frame
-' + b'Content-Type: image/jpeg
+'  b'Content-Type: image/jpeg
 
 ' + jpg_bytes + b'
 ')
