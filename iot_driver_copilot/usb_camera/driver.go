@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +9,7 @@ import (
 	"image/jpeg"
 	"io"
 	"log"
+	"mime/multipart"
 	"net/http"
 	"os"
 	"strconv"
@@ -20,255 +20,360 @@ import (
 	"gocv.io/x/gocv"
 )
 
-type VideoFormat string
-
-const (
-	FormatMJPEG VideoFormat = "MJPEG"
-	FormatYUYV  VideoFormat = "YUYV"
-	FormatH264  VideoFormat = "H264"
-	DefaultFormat           = FormatMJPEG
-)
-
-type Resolution struct {
-	Width  int
-	Height int
+type Config struct {
+	CameraID      int
+	HTTPHost      string
+	HTTPPort      string
+	DefaultWidth  int
+	DefaultHeight int
+	DefaultFormat string // "MJPEG" or "YUYV" or "H264" (MJPEG supported)
+	DefaultFPS    int
 }
 
-type CameraState struct {
-	mu           sync.Mutex
-	capturing    bool
-	streamCancel context.CancelFunc
-	format       VideoFormat
-	resolution   Resolution
-	deviceID     int
+type CameraServer struct {
+	mu            sync.RWMutex
+	capture       *gocv.VideoCapture
+	isCapturing   bool
+	format        string // "MJPEG"
+	width         int
+	height        int
+	fps           int
+	frameBuf      *gocv.Mat
+	captureCond   *sync.Cond
+	stopChan      chan struct{}
+	activeStreams int
 }
 
-func (cs *CameraState) StartCapture(format VideoFormat, resolution Resolution) error {
+func getenvInt(key string, fallback int) int {
+	if v := os.Getenv(key); v != "" {
+		if i, err := strconv.Atoi(v); err == nil {
+			return i
+		}
+	}
+	return fallback
+}
+
+func getenvStr(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
+func getenvCameraConfig() Config {
+	return Config{
+		CameraID:      getenvInt("CAMERA_ID", 0),
+		HTTPHost:      getenvStr("HTTP_HOST", "0.0.0.0"),
+		HTTPPort:      getenvStr("HTTP_PORT", "8080"),
+		DefaultWidth:  getenvInt("DEFAULT_WIDTH", 640),
+		DefaultHeight: getenvInt("DEFAULT_HEIGHT", 480),
+		DefaultFormat: strings.ToUpper(getenvStr("DEFAULT_FORMAT", "MJPEG")),
+		DefaultFPS:    getenvInt("DEFAULT_FPS", 15),
+	}
+}
+
+func NewCameraServer(cfg Config) *CameraServer {
+	return &CameraServer{
+		format:      cfg.DefaultFormat,
+		width:       cfg.DefaultWidth,
+		height:      cfg.DefaultHeight,
+		fps:         cfg.DefaultFPS,
+		frameBuf:    nil,
+		captureCond: sync.NewCond(&sync.Mutex{}),
+		stopChan:    make(chan struct{}),
+	}
+}
+
+func (cs *CameraServer) StartCapture(format string, width, height, fps int) error {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
-	if cs.capturing {
-		return errors.New("capture already in progress")
+	if cs.isCapturing {
+		return nil
 	}
+	if format == "" {
+		format = cs.format
+	}
+	if width == 0 {
+		width = cs.width
+	}
+	if height == 0 {
+		height = cs.height
+	}
+	if fps == 0 {
+		fps = cs.fps
+	}
+	cap, err := gocv.OpenVideoCapture(cs.getCameraID())
+	if err != nil {
+		return err
+	}
+	if !cap.IsOpened() {
+		return errors.New("cannot open USB camera")
+	}
+	cap.Set(gocv.VideoCaptureFrameWidth, float64(width))
+	cap.Set(gocv.VideoCaptureFrameHeight, float64(height))
+	cap.Set(gocv.VideoCaptureFPS, float64(fps))
+	cs.capture = cap
+	cs.width = width
+	cs.height = height
+	cs.fps = fps
 	cs.format = format
-	cs.resolution = resolution
-	cs.capturing = true
+	cs.isCapturing = true
+	cs.stopChan = make(chan struct{})
+	go cs.captureLoop()
 	return nil
 }
 
-func (cs *CameraState) StopCapture() {
+func (cs *CameraServer) getCameraID() int {
+	return getenvInt("CAMERA_ID", 0)
+}
+
+func (cs *CameraServer) StopCapture() {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
-	if cs.streamCancel != nil {
-		cs.streamCancel()
-		cs.streamCancel = nil
-	}
-	cs.capturing = false
-}
-
-func (cs *CameraState) IsCapturing() bool {
-	cs.mu.Lock()
-	defer cs.mu.Unlock()
-	return cs.capturing
-}
-
-func (cs *CameraState) SetStreamCancel(cancel context.CancelFunc) {
-	cs.mu.Lock()
-	defer cs.mu.Unlock()
-	cs.streamCancel = cancel
-}
-
-func parseFormat(s string) VideoFormat {
-	switch strings.ToUpper(s) {
-	case "MJPEG":
-		return FormatMJPEG
-	case "H264":
-		return FormatH264
-	case "YUYV":
-		return FormatYUYV
-	default:
-		return DefaultFormat
-	}
-}
-
-func parseResolution(qs map[string][]string) Resolution {
-	w, _ := strconv.Atoi(getFirst(qs, "width", "640"))
-	h, _ := strconv.Atoi(getFirst(qs, "height", "480"))
-	return Resolution{Width: w, Height: h}
-}
-
-func getFirst(qs map[string][]string, key string, def string) string {
-	if v, ok := qs[key]; ok && len(v) > 0 && v[0] != "" {
-		return v[0]
-	}
-	return def
-}
-
-func parseDeviceID() int {
-	deviceStr := os.Getenv("CAMERA_DEVICE_ID")
-	if deviceStr == "" {
-		deviceStr = "0"
-	}
-	deviceID, err := strconv.Atoi(deviceStr)
-	if err != nil {
-		return 0
-	}
-	return deviceID
-}
-
-func streamMJPEG(w http.ResponseWriter, req *http.Request, cs *CameraState, format VideoFormat, resolution Resolution) {
-	ctx, cancel := context.WithCancel(req.Context())
-	cs.SetStreamCancel(cancel)
-	defer cancel()
-
-	w.Header().Set("Content-Type", "multipart/x-mixed-replace; boundary=frame")
-
-	webcam, err := gocv.OpenVideoCapture(cs.deviceID)
-	if err != nil {
-		http.Error(w, "Unable to open camera device", http.StatusInternalServerError)
+	if !cs.isCapturing {
 		return
 	}
-	defer webcam.Close()
-	webcam.Set(gocv.VideoCaptureFrameWidth, float64(resolution.Width))
-	webcam.Set(gocv.VideoCaptureFrameHeight, float64(resolution.Height))
+	close(cs.stopChan)
+	cs.isCapturing = false
+	if cs.capture != nil {
+		cs.capture.Close()
+		cs.capture = nil
+	}
+	cs.captureCond.Broadcast()
+}
 
-	img := gocv.NewMat()
-	defer img.Close()
-
-	buf := &bytes.Buffer{}
-	for cs.IsCapturing() {
+func (cs *CameraServer) captureLoop() {
+	mat := gocv.NewMat()
+	defer mat.Close()
+	delay := time.Second / time.Duration(cs.fps)
+	for {
 		select {
-		case <-ctx.Done():
+		case <-cs.stopChan:
 			return
 		default:
-		}
-		if ok := webcam.Read(&img); !ok || img.Empty() {
-			time.Sleep(20 * time.Millisecond)
-			continue
-		}
-		buf.Reset()
-		jpgOpt := &jpeg.Options{Quality: 80}
-		imgMat, _ := img.ToImage()
-		if err := jpeg.Encode(buf, imgMat, jpgOpt); err != nil {
-			continue
-		}
-		fmt.Fprintf(w, "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %d\r\n\r\n", buf.Len())
-		if _, err := w.Write(buf.Bytes()); err != nil {
-			return
-		}
-		fmt.Fprint(w, "\r\n")
-		if f, ok := w.(http.Flusher); ok {
-			f.Flush()
+			if cs.capture == nil || !cs.capture.IsOpened() {
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+			if ok := cs.capture.Read(&mat); !ok || mat.Empty() {
+				time.Sleep(5 * time.Millisecond)
+				continue
+			}
+			cs.captureCond.L.Lock()
+			// Store a copy of the current frame
+			if cs.frameBuf != nil {
+				cs.frameBuf.Close()
+			}
+			frameCopy := mat.Clone()
+			cs.frameBuf = &frameCopy
+			cs.captureCond.Broadcast()
+			cs.captureCond.L.Unlock()
+			time.Sleep(delay)
 		}
 	}
 }
 
-func basicJSON(w http.ResponseWriter, status int, data map[string]interface{}) {
+func (cs *CameraServer) getLatestFrame() (*gocv.Mat, error) {
+	cs.captureCond.L.Lock()
+	defer cs.captureCond.L.Unlock()
+	// Wait for frame to be available
+	timeout := time.After(2 * time.Second)
+	for cs.frameBuf == nil {
+		cs.captureCond.Wait()
+		select {
+		case <-timeout:
+			return nil, errors.New("timeout waiting for frame")
+		default:
+		}
+	}
+	if cs.frameBuf == nil || cs.frameBuf.Empty() {
+		return nil, errors.New("no frame available")
+	}
+	frame := cs.frameBuf.Clone()
+	return &frame, nil
+}
+
+func parseQueryInt(r *http.Request, key string, fallback int) int {
+	v := r.URL.Query().Get(key)
+	if v == "" {
+		return fallback
+	}
+	if i, err := strconv.Atoi(v); err == nil {
+		return i
+	}
+	return fallback
+}
+
+func parseQueryStr(r *http.Request, key string, fallback string) string {
+	v := r.URL.Query().Get(key)
+	if v == "" {
+		return fallback
+	}
+	return v
+}
+
+func (cs *CameraServer) handleStartCapture(w http.ResponseWriter, r *http.Request) {
+	width := parseQueryInt(r, "width", cs.width)
+	height := parseQueryInt(r, "height", cs.height)
+	fps := parseQueryInt(r, "fps", cs.fps)
+	format := parseQueryStr(r, "format", cs.format)
+	err := cs.StartCapture(format, width, height, fps)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to start capture: %v", err), http.StatusInternalServerError)
+		return
+	}
+	resp := map[string]interface{}{
+		"status":  "started",
+		"format":  format,
+		"width":   width,
+		"height":  height,
+		"fps":     fps,
+		"message": "Video capture started",
+	}
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(data)
+	json.NewEncoder(w).Encode(resp)
 }
 
-func startHandler(cs *CameraState) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		format := parseFormat(getFirst(r.URL.Query(), "format", string(DefaultFormat)))
-		res := parseResolution(r.URL.Query())
-		err := cs.StartCapture(format, res)
-		if err != nil {
-			basicJSON(w, http.StatusBadRequest, map[string]interface{}{
-				"error": err.Error(),
-			})
+func (cs *CameraServer) handleStopCapture(w http.ResponseWriter, r *http.Request) {
+	cs.StopCapture()
+	resp := map[string]interface{}{
+		"status":  "stopped",
+		"message": "Video capture stopped",
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+func (cs *CameraServer) handleStreamMJPEG(w http.ResponseWriter, r *http.Request) {
+	cs.mu.RLock()
+	isCap := cs.isCapturing
+	cs.mu.RUnlock()
+	if !isCap {
+		http.Error(w, "Camera is not capturing", http.StatusConflict)
+		return
+	}
+	boundary := "mjpegstream"
+	w.Header().Set("Content-Type", "multipart/x-mixed-replace; boundary="+boundary)
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "close")
+	notify := w.(http.CloseNotifier).CloseNotify()
+
+	cs.mu.Lock()
+	cs.activeStreams++
+	cs.mu.Unlock()
+
+	defer func() {
+		cs.mu.Lock()
+		cs.activeStreams--
+		cs.mu.Unlock()
+	}()
+
+	for {
+		select {
+		case <-notify:
 			return
+		default:
+			frame, err := cs.getLatestFrame()
+			if err != nil {
+				time.Sleep(10 * time.Millisecond)
+				continue
+			}
+			buf, err := matToJPEG(frame)
+			frame.Close()
+			if err != nil {
+				time.Sleep(10 * time.Millisecond)
+				continue
+			}
+			fmt.Fprintf(w, "--%s\r\n", boundary)
+			fmt.Fprintf(w, "Content-Type: image/jpeg\r\n")
+			fmt.Fprintf(w, "Content-Length: %d\r\n\r\n", len(buf.Bytes()))
+			w.Write(buf.Bytes())
+			fmt.Fprintf(w, "\r\n")
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			time.Sleep(time.Second / time.Duration(cs.fps))
 		}
-		basicJSON(w, http.StatusOK, map[string]interface{}{
-			"message": "capture started",
-			"format":  format,
-			"width":   res.Width,
-			"height":  res.Height,
-		})
 	}
 }
 
-func stopHandler(cs *CameraState) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		cs.StopCapture()
-		basicJSON(w, http.StatusOK, map[string]interface{}{
-			"message": "capture stopped",
-		})
+func (cs *CameraServer) handleStream(w http.ResponseWriter, r *http.Request) {
+	format := parseQueryStr(r, "format", cs.format)
+	switch strings.ToUpper(format) {
+	case "MJPEG", "JPEG":
+		cs.handleStreamMJPEG(w, r)
+	default:
+		http.Error(w, "Unsupported stream format. Only MJPEG supported.", http.StatusBadRequest)
 	}
 }
 
-// For streaming endpoints: /stream and /video/stream
-func streamHandler(cs *CameraState) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if !cs.IsCapturing() {
-			http.Error(w, "Video capture not started. Start capture first.", http.StatusBadRequest)
-			return
-		}
-		format := parseFormat(getFirst(r.URL.Query(), "format", string(cs.format)))
-		res := parseResolution(r.URL.Query())
-		streamMJPEG(w, r, cs, format, res)
-	}
+func (cs *CameraServer) handleVideoStream(w http.ResponseWriter, r *http.Request) {
+	cs.handleStream(w, r)
 }
 
-// POST /capture/start and /video/start
-func captureStartHandler(cs *CameraState) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		format := parseFormat(getFirst(r.URL.Query(), "format", string(DefaultFormat)))
-		res := parseResolution(r.URL.Query())
-		err := cs.StartCapture(format, res)
-		if err != nil {
-			basicJSON(w, http.StatusBadRequest, map[string]interface{}{
-				"error": err.Error(),
-			})
-			return
-		}
-		basicJSON(w, http.StatusOK, map[string]interface{}{
-			"message": "video started",
-			"format":  format,
-			"width":   res.Width,
-			"height":  res.Height,
-		})
+func matToJPEG(mat *gocv.Mat) (*bytes.Buffer, error) {
+	img, err := mat.ToImage()
+	if err != nil {
+		return nil, err
 	}
+	buf := new(bytes.Buffer)
+	opt := &jpeg.Options{Quality: 80}
+	if err := jpeg.Encode(buf, img, opt); err != nil {
+		return nil, err
+	}
+	return buf, nil
 }
 
-// POST /capture/stop and /video/stop
-func captureStopHandler(cs *CameraState) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		cs.StopCapture()
-		basicJSON(w, http.StatusOK, map[string]interface{}{
-			"message": "video stopped",
-		})
-	}
+func (cs *CameraServer) handleRoot(w http.ResponseWriter, r *http.Request) {
+	w.Write([]byte("USB Camera HTTP Driver - Endpoints:\n" +
+		"GET /video/stream - MJPEG video stream\n" +
+		"GET /stream - MJPEG video stream\n" +
+		"POST /video/start - Start video capture\n" +
+		"POST /video/stop - Stop video capture\n" +
+		"POST /capture/start - Start video capture\n" +
+		"POST /capture/stop - Stop video capture\n"))
 }
 
 func main() {
-	host := os.Getenv("SHIFU_HTTP_HOST")
-	if host == "" {
-		host = "0.0.0.0"
-	}
-	port := os.Getenv("SHIFU_HTTP_PORT")
-	if port == "" {
-		port = "8080"
-	}
-	addr := fmt.Sprintf("%s:%s", host, port)
-	deviceID := parseDeviceID()
+	// Make sure we have OpenCV support
+	cfg := getenvCameraConfig()
+	cs := NewCameraServer(cfg)
 
-	cameraState := &CameraState{
-		capturing:  false,
-		format:     DefaultFormat,
-		resolution: Resolution{Width: 640, Height: 480},
-		deviceID:   deviceID,
-	}
+	mux := http.NewServeMux()
 
-	http.HandleFunc("/video/stream", streamHandler(cameraState))
-	http.HandleFunc("/stream", streamHandler(cameraState))
+	mux.HandleFunc("/", cs.handleRoot)
+	mux.HandleFunc("/video/stream", cs.handleVideoStream)
+	mux.HandleFunc("/stream", cs.handleStream)
+	mux.HandleFunc("/capture/start", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Only POST supported", http.StatusMethodNotAllowed)
+			return
+		}
+		cs.handleStartCapture(w, r)
+	})
+	mux.HandleFunc("/video/start", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Only POST supported", http.StatusMethodNotAllowed)
+			return
+		}
+		cs.handleStartCapture(w, r)
+	})
+	mux.HandleFunc("/video/stop", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Only POST supported", http.StatusMethodNotAllowed)
+			return
+		}
+		cs.handleStopCapture(w, r)
+	})
+	mux.HandleFunc("/capture/stop", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Only POST supported", http.StatusMethodNotAllowed)
+			return
+		}
+		cs.handleStopCapture(w, r)
+	})
 
-	http.HandleFunc("/capture/start", captureStartHandler(cameraState))
-	http.HandleFunc("/video/start", captureStartHandler(cameraState))
-
-	http.HandleFunc("/capture/stop", captureStopHandler(cameraState))
-	http.HandleFunc("/video/stop", captureStopHandler(cameraState))
-
-	log.Printf("Starting USB Camera HTTP driver on %s (device ID: %d)", addr, deviceID)
-	log.Fatal(http.ListenAndServe(addr, nil))
+	addr := fmt.Sprintf("%s:%s", cfg.HTTPHost, cfg.HTTPPort)
+	log.Printf("Starting USB Camera HTTP Driver on %s ...", addr)
+	log.Fatal(http.ListenAndServe(addr, mux))
 }
