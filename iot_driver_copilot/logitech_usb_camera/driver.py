@@ -1,166 +1,188 @@
 import os
+import cv2
 import threading
 import time
-import io
-import uuid
-
-from flask import Flask, Response, request, jsonify, send_file, abort
-import cv2
-
-# Environment Variables
-SERVER_HOST = os.getenv("SERVER_HOST", "0.0.0.0")
-SERVER_PORT = int(os.getenv("SERVER_PORT", "8080"))
-CAMERA_INDEX = int(os.getenv("CAMERA_INDEX", "0"))
-FRAME_WIDTH = int(os.getenv("FRAME_WIDTH", "640"))
-FRAME_HEIGHT = int(os.getenv("FRAME_HEIGHT", "480"))
-FRAME_RATE = int(os.getenv("FRAME_RATE", "20"))
-JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "90"))
-
+from flask import Flask, Response, request, jsonify, send_file, make_response
+from io import BytesIO
 app = Flask(__name__)
+
+# Configuration from environment variables
+HTTP_SERVER_HOST = os.environ.get('HTTP_SERVER_HOST', '0.0.0.0')
+HTTP_SERVER_PORT = int(os.environ.get('HTTP_SERVER_PORT', '5000'))
+
+DEFAULT_WIDTH = int(os.environ.get('CAMERA_DEFAULT_WIDTH', '640'))
+DEFAULT_HEIGHT = int(os.environ.get('CAMERA_DEFAULT_HEIGHT', '480'))
+DEFAULT_FPS = int(os.environ.get('CAMERA_DEFAULT_FPS', '30'))
+DEFAULT_FORMAT = os.environ.get('CAMERA_DEFAULT_FORMAT', 'MJPG')
+
+# Camera Manager to handle multiple cameras
+class CameraInstance:
+    def __init__(self, camera_id, width, height, fps, format_):
+        self.camera_id = camera_id
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self.format_ = format_
+        self.lock = threading.Lock()
+        self.running = False
+        self.cap = None
+
+    def start(self):
+        with self.lock:
+            if self.running:
+                return False, "Camera already running"
+            self.cap = cv2.VideoCapture(self.camera_id)
+            if not self.cap.isOpened():
+                return False, "Cannot open camera with id {}".format(self.camera_id)
+            # Set camera parameters
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+            self.cap.set(cv2.CAP_PROP_FPS, self.fps)
+            # Set format if supported
+            if self.format_.upper() == "MJPG":
+                self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+            self.running = True
+            return True, "Camera started"
+
+    def stop(self):
+        with self.lock:
+            if self.cap is not None:
+                self.cap.release()
+                self.cap = None
+            self.running = False
+
+    def read_frame(self):
+        with self.lock:
+            if not self.running or self.cap is None:
+                return None
+            ret, frame = self.cap.read()
+            if not ret:
+                return None
+            return frame
+
+    def is_running(self):
+        with self.lock:
+            return self.running and self.cap and self.cap.isOpened()
 
 class CameraManager:
     def __init__(self):
-        self.lock = threading.Lock()
-        self.capture = None
-        self.active_session = None
-        self.streaming_clients = 0
-        self.running = False
-        self.last_frame = None
-        self.frame_thread = None
+        self.cameras = {}
+        self.manager_lock = threading.Lock()
 
-    def start_capture(self):
-        with self.lock:
-            if self.capture is not None and self.running:
-                return self.active_session
-            self.capture = cv2.VideoCapture(CAMERA_INDEX)
-            self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
-            self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
-            self.capture.set(cv2.CAP_PROP_FPS, FRAME_RATE)
-            self.running = True
-            self.active_session = str(uuid.uuid4())
-            self.frame_thread = threading.Thread(target=self._update_frame, daemon=True)
-            self.frame_thread.start()
-            return self.active_session
+    def start_camera(self, camera_id, width, height, fps, format_):
+        with self.manager_lock:
+            if camera_id in self.cameras and self.cameras[camera_id].is_running():
+                return False, "Camera with id {} is already running".format(camera_id)
+            cam = CameraInstance(camera_id, width, height, fps, format_)
+            ok, msg = cam.start()
+            if ok:
+                self.cameras[camera_id] = cam
+            return ok, msg
 
-    def stop_capture(self):
-        with self.lock:
-            self.running = False
-            if self.capture:
-                self.capture.release()
-                self.capture = None
-            self.active_session = None
-            self.last_frame = None
+    def stop_camera(self, camera_id):
+        with self.manager_lock:
+            cam = self.cameras.get(camera_id)
+            if not cam or not cam.is_running():
+                return False, "Camera with id {} is not running".format(camera_id)
+            cam.stop()
+            del self.cameras[camera_id]
+            return True, "Camera with id {} stopped".format(camera_id)
 
-    def _update_frame(self):
-        while self.running:
-            if self.capture:
-                ret, frame = self.capture.read()
-                if ret:
-                    self.last_frame = frame
-            time.sleep(1.0 / FRAME_RATE)
-
-    def get_frame(self):
-        with self.lock:
-            if not self.running or self.last_frame is None:
-                raise RuntimeError("Camera not running or no frame available")
-            frame = self.last_frame.copy()
-        return frame
-
-    def capture_image(self, ext="jpeg", width=None, height=None):
-        frame = self.get_frame()
-        if width and height:
-            frame = cv2.resize(frame, (width, height))
-        encode_param = []
-        if ext.lower() == "jpeg" or ext.lower() == "jpg":
-            encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
-            ret, buf = cv2.imencode(".jpg", frame, encode_param)
-        elif ext.lower() == "png":
-            ret, buf = cv2.imencode(".png", frame)
-        else:
-            raise ValueError("Unsupported image format")
-        if not ret:
-            raise RuntimeError("Failed to encode image")
-        return io.BytesIO(buf.tobytes()), ext.lower()
-
-    def mjpeg_stream(self, width=None, height=None, quality=None):
-        while self.running:
-            try:
-                frame = self.get_frame()
-                if width and height:
-                    frame = cv2.resize(frame, (width, height))
-                encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), quality or JPEG_QUALITY]
-                ret, jpeg = cv2.imencode('.jpg', frame, encode_param)
-                if not ret:
-                    continue
-                yield (b'--frame\r\n'
-                       b'Content-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n')
-                time.sleep(1.0 / FRAME_RATE)
-            except Exception:
-                break
+    def get_camera(self, camera_id):
+        with self.manager_lock:
+            cam = self.cameras.get(camera_id)
+            if cam and cam.is_running():
+                return cam
+            return None
 
 camera_manager = CameraManager()
 
-@app.route("/capture", methods=["POST", "DELETE"])
-def capture_session():
-    if request.method == "POST":
-        session_id = camera_manager.start_capture()
-        return jsonify({"status": "started", "session_id": session_id})
-    elif request.method == "DELETE":
-        camera_manager.stop_capture()
-        return jsonify({"status": "stopped"})
-    else:
-        abort(405)
-
-@app.route("/camera/start", methods=["POST"])
-def camera_start():
-    session_id = camera_manager.start_capture()
-    return jsonify({"status": "started", "session_id": session_id})
-
-@app.route("/camera/stop", methods=["POST"])
-def camera_stop():
-    camera_manager.stop_capture()
-    return jsonify({"status": "stopped"})
-
-@app.route("/frame", methods=["GET"])
-def get_frame():
-    if not camera_manager.running:
-        abort(409, description="Camera is not capturing.")
-    ext = request.args.get("format", "jpeg").lower()
+@app.route('/camera/start', methods=['POST'])
+def start_camera():
     try:
-        width = int(request.args.get("width")) if request.args.get("width") else None
-        height = int(request.args.get("height")) if request.args.get("height") else None
-        img_io, img_ext = camera_manager.capture_image(ext, width, height)
-        mime = "image/jpeg" if img_ext in ["jpeg", "jpg"] else "image/png"
-        return send_file(img_io, mimetype=mime)
+        camera_id = int(request.args.get('camera_id', 0))
+        width = int(request.args.get('width', DEFAULT_WIDTH))
+        height = int(request.args.get('height', DEFAULT_HEIGHT))
+        fps = int(request.args.get('fps', DEFAULT_FPS))
+        format_ = request.args.get('format', DEFAULT_FORMAT)
+        ok, msg = camera_manager.start_camera(camera_id, width, height, fps, format_)
+        if ok:
+            return jsonify({"status": "success", "message": msg}), 200
+        else:
+            return jsonify({"status": "error", "message": msg}), 400
     except Exception as e:
-        abort(500, description=str(e))
+        return jsonify({"status": "error", "message": str(e)}), 500
 
-@app.route("/camera/capture", methods=["POST"])
-def camera_capture():
-    if not camera_manager.running:
-        abort(409, description="Camera is not capturing.")
-    ext = request.args.get("format", "jpeg").lower()
+@app.route('/camera/stop', methods=['POST'])
+def stop_camera():
     try:
-        width = int(request.args.get("width")) if request.args.get("width") else None
-        height = int(request.args.get("height")) if request.args.get("height") else None
-        img_io, img_ext = camera_manager.capture_image(ext, width, height)
-        mime = "image/jpeg" if img_ext in ["jpeg", "jpg"] else "image/png"
-        return send_file(img_io, mimetype=mime)
+        camera_id = int(request.args.get('camera_id', 0))
+        ok, msg = camera_manager.stop_camera(camera_id)
+        if ok:
+            return jsonify({"status": "success", "message": msg}), 200
+        else:
+            return jsonify({"status": "error", "message": msg}), 400
     except Exception as e:
-        abort(500, description=str(e))
+        return jsonify({"status": "error", "message": str(e)}), 500
 
-@app.route("/stream", methods=["GET"])
-@app.route("/camera/stream", methods=["GET"])
-def stream_video():
-    if not camera_manager.running:
-        abort(409, description="Camera is not capturing.")
-    width = int(request.args.get("width")) if request.args.get("width") else None
-    height = int(request.args.get("height")) if request.args.get("height") else None
-    quality = int(request.args.get("quality")) if request.args.get("quality") else None
-    return Response(
-        camera_manager.mjpeg_stream(width, height, quality),
-        mimetype="multipart/x-mixed-replace; boundary=frame"
-    )
+def gen_frames(camera_id):
+    cam = camera_manager.get_camera(camera_id)
+    if not cam:
+        return
+    while True:
+        frame = cam.read_frame()
+        if frame is None:
+            break
+        ret, buffer = cv2.imencode('.jpg', frame)
+        if not ret:
+            continue
+        jpg_bytes = buffer.tobytes()
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + jpg_bytes + b'\r\n')
+        time.sleep(1.0 / cam.fps if cam.fps > 0 else 0.03)
 
-if __name__ == "__main__":
-    app.run(host=SERVER_HOST, port=SERVER_PORT, threaded=True)
+@app.route('/camera/stream', methods=['GET'])
+def stream_camera():
+    try:
+        camera_id = int(request.args.get('camera_id', 0))
+        cam = camera_manager.get_camera(camera_id)
+        if not cam:
+            return jsonify({"status": "error", "message": "Camera with id {} is not running".format(camera_id)}), 400
+        return Response(gen_frames(camera_id),
+                        mimetype='multipart/x-mixed-replace; boundary=frame')
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/camera/capture', methods=['GET'])
+def capture_frame():
+    try:
+        camera_id = int(request.args.get('camera_id', 0))
+        image_format = request.args.get('format', 'jpg').lower()
+        cam = camera_manager.get_camera(camera_id)
+        if not cam:
+            return jsonify({"status": "error", "message": "Camera with id {} is not running".format(camera_id)}), 400
+        frame = cam.read_frame()
+        if frame is None:
+            return jsonify({"status": "error", "message": "Failed to capture frame"}), 500
+        # Supported formats: jpg, png
+        ext = '.jpg' if image_format not in ['png', 'jpeg'] else '.' + image_format
+        ret, buffer = cv2.imencode(ext, frame)
+        if not ret:
+            return jsonify({"status": "error", "message": "Failed to encode image"}), 500
+        img_bytes = buffer.tobytes()
+        img_io = BytesIO(img_bytes)
+        img_io.seek(0)
+        mimetype = 'image/jpeg' if ext in ['.jpg', '.jpeg'] else 'image/png'
+        response = make_response(send_file(
+            img_io,
+            mimetype=mimetype,
+            as_attachment=True,
+            download_name='capture{}'.format(ext)
+        ))
+        response.headers['Content-Disposition'] = f'attachment; filename=capture{ext}'
+        return response
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+# Run python app
+if __name__ == '__main__':
+    app.run(host=HTTP_SERVER_HOST, port=HTTP_SERVER_PORT, threaded=True)
