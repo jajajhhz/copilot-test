@@ -2,9 +2,9 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   labels:
-    app: deviceshifu-<no value>
+    app: deviceshifu-therometer-01
     workspace_id: "1b5034e7-11ad-4bda-b41d-32fc3bd51ac1"
-  name: deviceshifu-<no value>-configmap
+  name: deviceshifu-therometer-01-configmap
   namespace: deviceshifu
 data:
   driverProperties: |
@@ -22,9 +22,9 @@ apiVersion: v1
 kind: Service
 metadata:
   labels:
-    app: deviceshifu-<no value>
+    app: deviceshifu-therometer-01
     workspace_id: "1b5034e7-11ad-4bda-b41d-32fc3bd51ac1"
-  name: deviceshifu-<no value>-service
+  name: deviceshifu-therometer-01-service
   namespace: deviceshifu
 spec:
   ports:
@@ -33,26 +33,26 @@ spec:
     protocol: TCP
     targetPort: 8080
   selector:
-    app: deviceshifu-<no value>-deployment
+    app: deviceshifu-therometer-01-deployment
   type: LoadBalancer
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   labels:
-    app: deviceshifu-<no value>
+    app: deviceshifu-therometer-01
     workspace_id: "1b5034e7-11ad-4bda-b41d-32fc3bd51ac1"
-  name: deviceshifu-<no value>-deployment
+  name: deviceshifu-therometer-01-deployment
   namespace: deviceshifu
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: deviceshifu-<no value>-deployment
+      app: deviceshifu-therometer-01-deployment
   template:
     metadata:
       labels:
-        app: deviceshifu-<no value>-deployment
+        app: deviceshifu-therometer-01-deployment
     spec:
       containers:
         - image: edgehub/deviceshifu-http-http:v0.64.0
@@ -65,7 +65,7 @@ spec:
               readOnly: true
           env:
           - name: EDGEDEVICE_NAME
-            value: "deviceshifu-<no value>-edgedevice"
+            value: "deviceshifu-therometer-01-edgedevice"
           - name: EDGEDEVICE_NAMESPACE
             value: "devices"
         - name: shifu-driver
@@ -75,20 +75,20 @@ spec:
               protocol: TCP
           env:
             - name: DEVICE_ADDRESS
-              value: "<no value>"
+              value: "192.168.0.80:10123"
       volumes:
         - name: deviceshifu-config
           configMap:
-            name: deviceshifu-<no value>-configmap
+            name: deviceshifu-therometer-01-configmap
       serviceAccountName: edgedevice-sa
 ---
 apiVersion: shifu.edgenesis.io/v1alpha1
 kind: EdgeDevice
 metadata:
   labels:
-    app: deviceshifu-<no value>
+    app: deviceshifu-therometer-01
     workspace_id: "1b5034e7-11ad-4bda-b41d-32fc3bd51ac1"
-  name: deviceshifu-<no value>-edgedevice
+  name: deviceshifu-therometer-01-edgedevice
   namespace: devices
 spec:
   sku: "TAS-WS-R0020"
