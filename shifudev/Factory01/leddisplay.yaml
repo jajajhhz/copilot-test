@@ -1,0 +1,98 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: leddisplay-configmap
+  namespace: deviceshifu
+  annotations:
+    workspace.id: "1b5034e7-11ad-4bda-b41d-32fc3bd51ac1"
+    workspace.name: "Factory01"
+data:
+  driverProperties: |
+    driverSku: opcua-led-light-v1
+    driverImage: 
+  instructions: |
+    instructions:
+      "number":
+        protocolPropertyList:
+          OPCUANodeID: "ns=1;s=number"
+      "light":
+        protocolPropertyList:
+          OPCUANodeID: "ns=1;s=light"
+  telemetries: |
+    telemetries:
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: deviceshifu-leddisplay
+    workspace.id: "1b5034e7-11ad-4bda-b41d-32fc3bd51ac1"
+    workspace.name: "Factory01"
+  name: deviceshifu-leddisplay
+  namespace: deviceshifu
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: deviceshifu-leddisplay
+  template:
+    metadata:
+      labels:
+        app: deviceshifu-leddisplay
+        workspace.id: "1b5034e7-11ad-4bda-b41d-32fc3bd51ac1"
+        workspace.name: "Factory01"
+    spec:
+      containers:
+        - image: edgehub/deviceshifu-http-opcua:v0.64.0
+          name: deviceshifu-leddisplay
+          ports:
+            - containerPort: 8080
+          volumeMounts:
+            - name: deviceshifu-config
+              mountPath: "/etc/edgedevice/config"
+              readOnly: true
+          env:
+            - name: EDGEDEVICE_NAME
+              value: "edgedevice-leddisplay"
+            - name: EDGEDEVICE_NAMESPACE
+              value: "devices"
+      volumes:
+        - name: deviceshifu-config
+          configMap:
+            name: leddisplay-configmap
+      serviceAccountName: edgedevice-sa
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: deviceshifu-leddisplay
+    workspace.id: "1b5034e7-11ad-4bda-b41d-32fc3bd51ac1"
+    workspace.name: "Factory01"
+  name: deviceshifu-leddisplay
+  namespace: deviceshifu
+spec:
+  ports:
+    - port: 80
+      protocol: TCP
+      targetPort: 8080
+  selector:
+    app: deviceshifu-leddisplay
+  type: LoadBalancer
+---
+apiVersion: shifu.edgenesis.io/v1alpha1
+kind: EdgeDevice
+metadata:
+  name: edgedevice-leddisplay
+  namespace: devices
+  annotations:
+    workspace.id: "1b5034e7-11ad-4bda-b41d-32fc3bd51ac1"
+    workspace.name: "Factory01"
+spec:
+  sku: "OPC UA LED Light"
+  connection: Ethernet
+  address: "opc.tcp://192.168.0.23:4840"
+  protocol: "OPCUA"
+  protocolSettings:
+    OPCUASetting:
+      AuthenticationMode: Anonymous
