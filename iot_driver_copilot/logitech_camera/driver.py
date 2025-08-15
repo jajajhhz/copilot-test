@@ -1,145 +1,164 @@
 import os
 import io
 import cv2
-import threading
 import time
-import json
-from flask import Flask, Response, jsonify, request
+import threading
+from flask import Flask, Response, jsonify, send_file, request
 
 # Environment Variables
-HTTP_HOST = os.getenv('SHIFU_HTTP_HOST', '0.0.0.0')
-HTTP_PORT = int(os.getenv('SHIFU_HTTP_PORT', '8080'))
-CAMERA_INDEX = int(os.getenv('SHIFU_CAMERA_INDEX', '0'))
-FRAME_WIDTH = int(os.getenv('SHIFU_FRAME_WIDTH', '640'))
-FRAME_HEIGHT = int(os.getenv('SHIFU_FRAME_HEIGHT', '480'))
-FRAME_RATE = int(os.getenv('SHIFU_FRAME_RATE', '15'))
-IMAGE_FORMAT = os.getenv('SHIFU_IMAGE_FORMAT', 'jpeg').lower()  # 'jpeg' or 'png'
+HTTP_HOST = os.getenv("HTTP_HOST", "0.0.0.0")
+HTTP_PORT = int(os.getenv("HTTP_PORT", "8080"))
+CAMERA_DEVICE = int(os.getenv("CAMERA_DEVICE", "0"))
+FRAME_WIDTH = int(os.getenv("FRAME_WIDTH", "640"))
+FRAME_HEIGHT = int(os.getenv("FRAME_HEIGHT", "480"))
+FRAME_RATE = int(os.getenv("FRAME_RATE", "24"))
+IMAGE_FORMAT = os.getenv("IMAGE_FORMAT", "jpeg").lower()  # jpeg or png
 
 app = Flask(__name__)
 
-# Device Info
-DEVICE_INFO = {
-    "device_name": "Logitech Camera",
-    "device_model": "Logitech Camera",
-    "manufacturer": "Logitech",
-    "device_type": "Camera",
-    "supported_formats": ["MJPEG", "YUYV", "H.264", "JPEG", "PNG"]
-}
+# Camera and Streaming Management
+class CameraManager:
+    def __init__(self, device, width, height, fps):
+        self.device_index = device
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self.cap = None
+        self.lock = threading.Lock()
+        self.streaming = False
+        self.last_frame = None
+        self.thread = None
+        self.thread_stop = threading.Event()
 
-# Internal State
-stream_active = threading.Event()
-stream_lock = threading.Lock()
-camera_capture = None
-last_frame = None
-last_frame_time = None
+    def open_camera(self):
+        if self.cap is None or not self.cap.isOpened():
+            self.cap = cv2.VideoCapture(self.device_index)
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+            self.cap.set(cv2.CAP_PROP_FPS, self.fps)
 
+    def release_camera(self):
+        if self.cap and self.cap.isOpened():
+            self.cap.release()
+        self.cap = None
 
-def get_camera():
-    global camera_capture
-    if camera_capture is None:
-        camera_capture = cv2.VideoCapture(CAMERA_INDEX)
-        camera_capture.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
-        camera_capture.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
-        camera_capture.set(cv2.CAP_PROP_FPS, FRAME_RATE)
-    return camera_capture
-
-
-def release_camera():
-    global camera_capture
-    if camera_capture is not None:
-        camera_capture.release()
-        camera_capture = None
-
-
-def encode_image(frame, fmt):
-    if fmt == 'png':
-        ret, buf = cv2.imencode('.png', frame)
-        mime_type = 'image/png'
-    else:
-        ret, buf = cv2.imencode('.jpg', frame)
-        mime_type = 'image/jpeg'
-    return (buf.tobytes(), mime_type) if ret else (None, None)
-
-
-def gen_mjpeg_stream():
-    global last_frame, last_frame_time
-    camera = get_camera()
-    while stream_active.is_set():
-        ret, frame = camera.read()
+    def get_frame(self):
+        self.open_camera()
+        ret, frame = self.cap.read()
         if not ret:
-            continue
-        last_frame = frame
-        last_frame_time = time.time()
-        img_bytes, _ = encode_image(frame, 'jpeg')
-        if img_bytes is not None:
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + img_bytes + b'\r\n')
-        time.sleep(1.0 / FRAME_RATE)
+            raise RuntimeError("Failed to capture image from camera.")
+        self.last_frame = frame
+        return frame
 
+    def encode_frame(self, frame, fmt):
+        if fmt == "png":
+            ret, buf = cv2.imencode('.png', frame)
+            mime = "image/png"
+        else:
+            ret, buf = cv2.imencode('.jpg', frame)
+            mime = "image/jpeg"
+        if not ret:
+            raise RuntimeError("Failed to encode image.")
+        return buf.tobytes(), mime
+
+    def capture_image(self, fmt):
+        with self.lock:
+            frame = self.get_frame()
+            img_bytes, mime = self.encode_frame(frame, fmt)
+            return img_bytes, mime
+
+    def start_stream(self):
+        if self.streaming:
+            return
+        self.streaming = True
+        self.thread_stop.clear()
+        if not self.thread or not self.thread.is_alive():
+            self.thread = threading.Thread(target=self._stream_worker, daemon=True)
+            self.thread.start()
+
+    def stop_stream(self):
+        self.streaming = False
+        self.thread_stop.set()
+        self.release_camera()
+
+    def _stream_worker(self):
+        self.open_camera()
+        while self.streaming and not self.thread_stop.is_set():
+            try:
+                ret, frame = self.cap.read()
+                if not ret:
+                    continue
+                with self.lock:
+                    self.last_frame = frame
+                time.sleep(1.0 / max(self.fps, 1))
+            except Exception:
+                continue
+        self.release_camera()
+
+    def generate_mjpeg(self):
+        while self.streaming:
+            with self.lock:
+                frame = self.last_frame
+            if frame is not None:
+                img_bytes, _ = self.encode_frame(frame, "jpeg")
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n\r\n' + img_bytes + b'\r\n')
+            time.sleep(1.0 / max(self.fps, 1))
+
+camera = CameraManager(CAMERA_DEVICE, FRAME_WIDTH, FRAME_HEIGHT, FRAME_RATE)
+
+# API Endpoints
 
 @app.route('/camera/info', methods=['GET'])
 def camera_info():
-    return jsonify({
-        "device_name": DEVICE_INFO["device_name"],
-        "device_model": DEVICE_INFO["device_model"],
-        "manufacturer": DEVICE_INFO["manufacturer"],
-        "device_type": DEVICE_INFO["device_type"],
-        "supported_formats": DEVICE_INFO["supported_formats"],
-        "frame_width": FRAME_WIDTH,
-        "frame_height": FRAME_HEIGHT,
-        "frame_rate": FRAME_RATE
-    })
-
+    info = {
+        "device_name": "Logitech Camera",
+        "device_model": "Logitech Camera",
+        "manufacturer": "Logitech",
+        "device_type": "Camera",
+        "supported_formats": ["MJPEG", "YUYV", "H.264", "JPEG", "PNG"],
+        "commands": ["start stream", "stop stream", "capture image"],
+    }
+    return jsonify(info)
 
 @app.route('/stream/start', methods=['POST'])
 @app.route('/camera/stream/start', methods=['POST'])
 def start_stream():
-    with stream_lock:
-        if not stream_active.is_set():
-            stream_active.set()
-        return jsonify({"status": "streaming", "message": "Camera streaming started."}), 200
-
+    camera.start_stream()
+    return jsonify({"status": "streaming started"}), 200
 
 @app.route('/stream/stop', methods=['POST'])
 @app.route('/camera/stream/stop', methods=['POST'])
 def stop_stream():
-    with stream_lock:
-        if stream_active.is_set():
-            stream_active.clear()
-            release_camera()
-        return jsonify({"status": "stopped", "message": "Camera streaming stopped."}), 200
+    camera.stop_stream()
+    return jsonify({"status": "streaming stopped"}), 200
 
+@app.route('/video_feed', methods=['GET'])
+def video_feed():
+    if not camera.streaming:
+        camera.start_stream()
+    return Response(camera.generate_mjpeg(),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
 
 @app.route('/camera/capture', methods=['POST'])
 @app.route('/capture', methods=['POST'])
-def capture_image():
-    fmt = IMAGE_FORMAT
-    camera = get_camera()
-    ret, frame = camera.read()
-    if not ret:
-        return jsonify({"error": "Failed to capture image"}), 500
-    img_bytes, mime_type = encode_image(frame, fmt)
-    if img_bytes is None:
-        return jsonify({"error": "Image encoding failed"}), 500
-    timestamp = time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime())
-    return Response(img_bytes, mimetype=mime_type, headers={
-        'X-Image-Timestamp': timestamp,
-        'X-Image-Format': fmt.upper()
-    })
+def capture():
+    fmt = request.args.get('format', IMAGE_FORMAT)
+    if fmt not in ["jpeg", "png"]:
+        fmt = IMAGE_FORMAT
+    img_bytes, mime = camera.capture_image(fmt)
+    ts = int(time.time() * 1000)
+    ext = "jpg" if fmt == "jpeg" else "png"
+    return send_file(
+        io.BytesIO(img_bytes),
+        mimetype=mime,
+        as_attachment=True,
+        download_name=f"capture_{ts}.{ext}",
+        headers={
+            "X-Timestamp": str(ts),
+            "X-Image-Format": fmt
+        }
+    )
 
-
-@app.route('/camera/stream')
-def mjpeg_stream():
-    if not stream_active.is_set():
-        return jsonify({"error": "Stream not active. Start stream first."}), 400
-    return Response(gen_mjpeg_stream(),
-                    mimetype='multipart/x-mixed-replace; boundary=frame')
-
-
-@app.route('/health', methods=['GET'])
-def health():
-    return jsonify({"status": "ok"})
-
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     app.run(host=HTTP_HOST, port=HTTP_PORT, threaded=True)
