@@ -1,177 +1,183 @@
 import os
+import io
 import cv2
 import threading
 import time
-import io
-import json
+from flask import Flask, Response, jsonify, request, send_file, stream_with_context
 from datetime import datetime
-from flask import Flask, Response, jsonify, send_file, request
 
-# ---- Environment Variable Configuration ----
-HTTP_HOST = os.environ.get("HTTP_HOST", "0.0.0.0")
-HTTP_PORT = int(os.environ.get("HTTP_PORT", "8080"))
-CAMERA_INDEX = int(os.environ.get("CAMERA_INDEX", "0"))
-CAPTURE_IMAGE_FORMAT = os.environ.get("CAPTURE_IMAGE_FORMAT", "jpeg").lower()  # jpeg or png
-STREAM_FRAME_WIDTH = int(os.environ.get("STREAM_FRAME_WIDTH", "640"))
-STREAM_FRAME_HEIGHT = int(os.environ.get("STREAM_FRAME_HEIGHT", "480"))
-STREAM_FRAME_RATE = int(os.environ.get("STREAM_FRAME_RATE", "20"))
+# Get configuration from environment variables
+CAMERA_INDEX = int(os.environ.get('CAMERA_INDEX', '0'))
+SERVER_HOST = os.environ.get('SERVER_HOST', '0.0.0.0')
+SERVER_PORT = int(os.environ.get('SERVER_PORT', '8080'))
+IMAGE_FORMAT = os.environ.get('IMAGE_FORMAT', 'jpeg').lower()  # 'jpeg' or 'png'
+FRAME_WIDTH = int(os.environ.get('FRAME_WIDTH', '640'))
+FRAME_HEIGHT = int(os.environ.get('FRAME_HEIGHT', '480'))
+FRAME_RATE = int(os.environ.get('FRAME_RATE', '15'))
 
+# Device info
 DEVICE_INFO = {
     "device_name": "Logitech Camera",
     "device_model": "Logitech Camera",
     "manufacturer": "Logitech",
     "device_type": "Camera",
-    "supported_formats": ["MJPEG", "YUYV", "H.264", "JPEG", "PNG"],
+    "supported_formats": ["MJPEG", "YUYV", "H.264", "JPEG", "PNG"]
 }
 
-# ---- Camera Streaming and Capture Logic ----
-
-class CameraManager:
-    def __init__(self, camera_index):
-        self.camera_index = camera_index
-        self.lock = threading.Lock()
-        self.cap = None
-        self.streaming = False
-        self.frame = None
-        self.thread = None
-        self.stop_event = threading.Event()
-
-    def start_capture(self):
-        with self.lock:
-            if self.cap is None:
-                self.cap = cv2.VideoCapture(self.camera_index)
-                self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, STREAM_FRAME_WIDTH)
-                self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, STREAM_FRAME_HEIGHT)
-                self.cap.set(cv2.CAP_PROP_FPS, STREAM_FRAME_RATE)
-        return self.cap.isOpened()
-
-    def release_capture(self):
-        with self.lock:
-            if self.cap is not None:
-                self.cap.release()
-                self.cap = None
-
-    def get_frame(self):
-        if self.cap is None:
-            if not self.start_capture():
-                return None
-        ret, frame = self.cap.read()
-        if not ret:
-            return None
-        return frame
-
-    def capture_image(self, img_format="jpeg"):
-        frame = self.get_frame()
-        if frame is None:
-            return None, None
-        ext = '.jpg' if img_format == "jpeg" else '.png'
-        encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 90] if img_format == "jpeg" else [int(cv2.IMWRITE_PNG_COMPRESSION), 3]
-        ret, buffer = cv2.imencode(ext, frame, encode_param)
-        if not ret:
-            return None, None
-        return buffer.tobytes(), ext[1:]
-
-    def start_streaming(self):
-        if self.streaming:
-            return
-        self.stop_event.clear()
-        self.streaming = True
-        if self.cap is None:
-            self.start_capture()
-        self.thread = threading.Thread(target=self.update_frames, daemon=True)
-        self.thread.start()
-
-    def update_frames(self):
-        while self.streaming and not self.stop_event.is_set():
-            frame = self.get_frame()
-            with self.lock:
-                self.frame = frame
-            time.sleep(1.0 / STREAM_FRAME_RATE)
-
-    def stop_streaming(self):
-        self.streaming = False
-        self.stop_event.set()
-        if self.thread is not None:
-            self.thread.join(timeout=2)
-            self.thread = None
-        self.release_capture()
-
-    def generate_mjpeg(self):
-        while self.streaming:
-            with self.lock:
-                frame = self.frame
-            if frame is None:
-                time.sleep(0.05)
-                continue
-            ret, jpeg = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-            if not ret:
-                continue
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n')
-            time.sleep(1.0 / STREAM_FRAME_RATE)
-
-camera_manager = CameraManager(CAMERA_INDEX)
-
-# ---- Flask App ----
 app = Flask(__name__)
 
-@app.route("/camera/info", methods=["GET"])
+# Global state for streaming
+streaming_state = {
+    "active": False,
+    "thread": None,
+    "lock": threading.Lock(),
+    "frame": None,
+    "last_frame_time": 0,
+    "camera": None
+}
+
+
+def get_camera():
+    camera = cv2.VideoCapture(CAMERA_INDEX)
+    camera.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
+    camera.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+    camera.set(cv2.CAP_PROP_FPS, FRAME_RATE)
+    return camera
+
+
+def release_camera(camera):
+    if camera is not None and camera.isOpened():
+        camera.release()
+
+
+def read_frame(camera):
+    if not camera.isOpened():
+        camera.open(CAMERA_INDEX)
+    ret, frame = camera.read()
+    return frame if ret else None
+
+
+def encode_image(frame, ext='.jpg'):
+    encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 90] if ext == '.jpg' else [int(cv2.IMWRITE_PNG_COMPRESSION), 3]
+    ret, buf = cv2.imencode(ext, frame, encode_param)
+    if not ret:
+        return None
+    return buf.tobytes()
+
+
+# Background streaming thread
+def streaming_loop():
+    camera = get_camera()
+    with streaming_state["lock"]:
+        streaming_state["camera"] = camera
+    try:
+        while streaming_state["active"]:
+            frame = read_frame(camera)
+            if frame is not None:
+                with streaming_state["lock"]:
+                    streaming_state["frame"] = frame
+                    streaming_state["last_frame_time"] = time.time()
+            time.sleep(1.0 / FRAME_RATE)
+    finally:
+        release_camera(camera)
+        with streaming_state["lock"]:
+            streaming_state["camera"] = None
+            streaming_state["frame"] = None
+
+
+def start_streaming_thread():
+    with streaming_state["lock"]:
+        if not streaming_state["active"]:
+            streaming_state["active"] = True
+            streaming_state["thread"] = threading.Thread(target=streaming_loop, daemon=True)
+            streaming_state["thread"].start()
+
+
+def stop_streaming_thread():
+    with streaming_state["lock"]:
+        streaming_state["active"] = False
+        thread = streaming_state["thread"]
+    if thread is not None:
+        thread.join(timeout=1.0)
+    with streaming_state["lock"]:
+        streaming_state["thread"] = None
+        streaming_state["frame"] = None
+    # Camera will be released in streaming_loop
+
+
+@app.route('/camera/info', methods=['GET'])
 def camera_info():
-    return jsonify(DEVICE_INFO), 200
+    return jsonify(DEVICE_INFO)
 
-@app.route("/capture", methods=["POST"])
-@app.route("/camera/capture", methods=["POST"])
-def capture_image():
-    img_format = CAPTURE_IMAGE_FORMAT
-    if request.is_json:
-        data = request.get_json()
-        img_format = data.get('format', img_format)
-    img_format = img_format.lower()
-    if img_format not in ("jpeg", "png"):
-        img_format = "jpeg"
-    img_bytes, ext = camera_manager.capture_image(img_format)
+
+@app.route('/camera/capture', methods=['POST'])
+@app.route('/capture', methods=['POST'])
+def camera_capture():
+    camera = get_camera()
+    frame = read_frame(camera)
+    release_camera(camera)
+    if frame is None:
+        return jsonify({"success": False, "error": "Could not capture image"}), 500
+    ext = '.jpg' if IMAGE_FORMAT == 'jpeg' else '.png'
+    img_bytes = encode_image(frame, ext=ext)
     if img_bytes is None:
-        return jsonify({"success": False, "error": "Failed to capture image"}), 500
-    ts = datetime.utcnow().isoformat() + "Z"
-    filename = f"capture_{ts.replace(':','-').replace('.','_')}.{ext}"
-    return send_file(
+        return jsonify({"success": False, "error": "Image encoding failed"}), 500
+
+    timestamp = datetime.utcnow().isoformat() + 'Z'
+    meta = {
+        "format": IMAGE_FORMAT.upper(),
+        "timestamp": timestamp,
+        "size_bytes": len(img_bytes),
+    }
+    response = send_file(
         io.BytesIO(img_bytes),
-        mimetype=f"image/{ext}",
+        mimetype='image/jpeg' if IMAGE_FORMAT == 'jpeg' else 'image/png',
         as_attachment=True,
-        download_name=filename,
-        headers={
-            "X-Timestamp": ts,
-            "X-Image-Format": ext
-        }
+        download_name=f'capture_{timestamp.replace(":", "-")}{ext}'
     )
+    response.headers['X-Capture-Metadata'] = str(meta)
+    return response
 
-@app.route("/stream/start", methods=["POST"])
-@app.route("/camera/stream/start", methods=["POST"])
-def start_stream():
-    camera_manager.start_streaming()
-    return jsonify({
-        "success": True,
-        "status": "streaming",
-        "stream_url": f"http://{HTTP_HOST}:{HTTP_PORT}/stream"
-    }), 200
 
-@app.route("/stream/stop", methods=["POST"])
-@app.route("/camera/stream/stop", methods=["POST"])
-def stop_stream():
-    camera_manager.stop_streaming()
-    return jsonify({
-        "success": True,
-        "status": "stopped"
-    }), 200
+def mjpeg_stream_generator():
+    while True:
+        with streaming_state["lock"]:
+            frame = streaming_state["frame"]
+            active = streaming_state["active"]
+        if not active:
+            break
+        if frame is not None:
+            img_bytes = encode_image(frame, ext='.jpg')
+            if img_bytes is not None:
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n\r\n' + img_bytes + b'\r\n')
+        time.sleep(1.0 / FRAME_RATE)
 
-@app.route("/stream", methods=["GET"])
-def stream_video():
-    if not camera_manager.streaming:
-        camera_manager.start_streaming()
+
+@app.route('/stream/start', methods=['POST'])
+@app.route('/camera/stream/start', methods=['POST'])
+def stream_start():
+    start_streaming_thread()
+    return jsonify({"success": True, "message": "Streaming started"})
+
+
+@app.route('/stream/stop', methods=['POST'])
+@app.route('/camera/stream/stop', methods=['POST'])
+def stream_stop():
+    stop_streaming_thread()
+    return jsonify({"success": True, "message": "Streaming stopped"})
+
+
+@app.route('/video_feed', methods=['GET'])
+def video_feed():
+    with streaming_state["lock"]:
+        if not streaming_state["active"]:
+            return jsonify({"success": False, "error": "Streaming not started"}), 400
     return Response(
-        camera_manager.generate_mjpeg(),
+        stream_with_context(mjpeg_stream_generator()),
         mimetype='multipart/x-mixed-replace; boundary=frame'
     )
 
-if __name__ == "__main__":
-    app.run(host=HTTP_HOST, port=HTTP_PORT, threaded=True)
+
+if __name__ == '__main__':
+    app.run(host=SERVER_HOST, port=SERVER_PORT, threaded=True)
