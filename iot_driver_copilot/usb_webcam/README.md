@@ -1,85 +1,78 @@
-USB Webcam HTTP Driver (UVC → HTTP)
+USB Webcam HTTP Driver (UVC to HTTP)
 
-This driver connects to a USB UVC webcam, continuously captures frames, and exposes them over a lightweight HTTP server.
+This driver connects to a USB webcam using its native UVC interface (via OpenCV) and exposes an HTTP server with two endpoints:
 
-- Native protocol: UVC (USB Video Class)
-- Output protocol: HTTP (JPEG frame and MJPEG stream)
-- Language: Python
+- GET /stream — Live MJPEG stream (multipart/x-mixed-replace)
+- GET /frame — Capture a single JPEG frame
 
-Exposed endpoints
+It maintains a background capture loop with timeout, retry, and exponential backoff, and serves the latest frame from a thread-safe buffer.
+
+Requirements
+
+- Python 3.8+
+- A UVC-compatible USB webcam
+- OpenCV for Python
+
+Install
+
+- pip install -r requirements.txt
+
+Configuration (Environment Variables)
+
+All configuration must come from environment variables. Required variables:
+
+- HTTP_HOST: Host/IP to bind the HTTP server (e.g., 0.0.0.0)
+- HTTP_PORT: Port to bind the HTTP server (e.g., 8000)
+- CAMERA_PATH: Device path (e.g., /dev/video0) — optional alternative to CAMERA_INDEX
+- CAMERA_INDEX: Camera index (e.g., 0) — required if CAMERA_PATH not set
+- BACKOFF_INITIAL_MS: Initial retry backoff in milliseconds (e.g., 200)
+- BACKOFF_MAX_MS: Maximum retry backoff in milliseconds (e.g., 5000)
+- BACKOFF_MULTIPLIER: Exponential backoff multiplier (>= 1.0, e.g., 1.5)
+- STALE_TIMEOUT_SEC: Consider the camera disconnected if no successful frame for this many seconds (e.g., 3)
+- LOOP_SLEEP_MS: Minimum sleep between capture loop iterations (e.g., 10)
+- STREAM_MIN_INTERVAL_MS: Minimum interval between MJPEG frames per client in milliseconds (e.g., 50)
+- JPEG_QUALITY: JPEG quality (1-100, e.g., 85)
+- LOG_LEVEL: Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+
+Optional variables (applied if provided):
+
+- FRAME_WIDTH: Desired frame width (e.g., 1280)
+- FRAME_HEIGHT: Desired frame height (e.g., 720)
+- FRAME_RATE: Desired capture FPS (e.g., 30)
+
+Run
+
+- Export environment variables, then run: python driver.py
+
+Example
+
+- export HTTP_HOST=0.0.0.0
+- export HTTP_PORT=8000
+- export CAMERA_INDEX=0
+- export BACKOFF_INITIAL_MS=200
+- export BACKOFF_MAX_MS=5000
+- export BACKOFF_MULTIPLIER=1.5
+- export STALE_TIMEOUT_SEC=3
+- export LOOP_SLEEP_MS=10
+- export STREAM_MIN_INTERVAL_MS=50
+- export JPEG_QUALITY=85
+- export LOG_LEVEL=INFO
+- python driver.py
+
+API
 
 - GET /frame
-  - Returns the latest frame as image/jpeg.
+  - Captures and returns the latest available frame as a JPEG image.
+  - Example: curl -v http://localhost:8000/frame --output snapshot.jpg
+
 - GET /stream
-  - Returns a multipart/x-mixed-replace MJPEG stream. Each part is a JPEG frame.
+  - Returns a multipart/x-mixed-replace MJPEG stream for live preview.
+  - Open in a web browser: http://localhost:8000/stream
+  - CLI example: curl -v http://localhost:8000/stream
 
-Quick start
+Notes
 
-1) Install dependencies
-
-- Python 3.9+ recommended
-- Install Python packages:
-
-  pip install -r requirements.txt
-
-2) Plug your USB webcam
-
-3) Run the driver
-
-- Defaults to camera index 0 on port 8000:
-
-  HTTP_PORT=8000 WEBCAM_DEVICE=0 python driver.py
-
-4) Try it
-
-- Fetch a single snapshot:
-
-  curl -v http://localhost:8000/frame -o snapshot.jpg
-
-- Open live MJPEG stream in a browser:
-
-  http://localhost:8000/stream
-
-Environment variables
-
-- HTTP_HOST (default: 0.0.0.0)
-  - Host/IP for the HTTP server to bind.
-- HTTP_PORT (default: 8000)
-  - Port for the HTTP server.
-- WEBCAM_DEVICE (default: 0)
-  - Camera index (e.g., 0) or device path (e.g., /dev/video0).
-- WEBCAM_WIDTH (optional)
-  - Requested capture width in pixels.
-- WEBCAM_HEIGHT (optional)
-  - Requested capture height in pixels.
-- WEBCAM_FPS (optional)
-  - Requested capture frame rate.
-- JPEG_QUALITY (default: 80, range: 1-100)
-  - JPEG compression quality for frames.
-- CAPTURE_TIMEOUT_SEC (default: 5.0)
-  - Watchdog for frame acquisition; used to determine when to reopen the device if frames stall.
-- RECONNECT_BASE_BACKOFF_SEC (default: 0.5)
-  - Initial backoff delay when reconnecting the camera.
-- RECONNECT_MAX_BACKOFF_SEC (default: 10.0)
-  - Maximum backoff delay when reconnecting the camera.
-- LOG_LEVEL (default: INFO)
-  - One of: DEBUG, INFO, WARNING, ERROR, CRITICAL.
-
-Behavior and notes
-
-- The driver runs a background capture loop that continuously ingests UVC frames, encodes them to JPEG, and stores the most recent frame in a thread-safe buffer.
-- If the camera disconnects or frame reads fail, the driver retries with exponential backoff and logs events.
-- Multiple clients can connect to /stream concurrently; each receives the latest frames as they arrive.
-- Graceful shutdown is supported via Ctrl+C (SIGINT) or SIGTERM.
-
-Troubleshooting
-
-- On Linux, the webcam usually appears as /dev/video0, /dev/video1, etc.
-- If you see connection or frame read errors, try lowering resolution or FPS with WEBCAM_WIDTH/HEIGHT/FPS.
-- Some platforms/backends may not support all property settings; the driver attempts them best-effort.
-
-License
-
-- This project is provided as-is, for demonstration and integration purposes.
+- The driver implements a background capture loop with exponential backoff and stale-frame timeout. It will attempt to reconnect automatically if the camera becomes unavailable.
+- For MJPEG streaming, each client receives the most recent frames at or below STREAM_MIN_INTERVAL_MS cadence.
 
 Generated by [IoT Driver Copilot](https://copilot.test.shifu.dev/)
