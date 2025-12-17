@@ -1,0 +1,284 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: deviceshifu-soil-sensor-config
+  namespace: deviceshifu
+data:
+  driverProperties: |
+    driverSku: "modbus-tcp"
+    driverImage: "deviceshifu-modbus-tcp:latest"
+  instructions: |
+    instructions:
+      soil_moisture:
+        protocolPropertyList:
+          RegisterAddress: "0"
+          FunctionCode: "holdingregister"
+          Quantity: 1
+          DataType: "uint16"
+          Operation: "R"
+          Scale: 0.1
+      soil_temperature:
+        protocolPropertyList:
+          RegisterAddress: "1"
+          FunctionCode: "holdingregister"
+          Quantity: 1
+          DataType: "int16"
+          Operation: "R"
+          Scale: 0.1
+      soil_ec:
+        protocolPropertyList:
+          RegisterAddress: "2"
+          FunctionCode: "holdingregister"
+          Quantity: 1
+          DataType: "uint16"
+          Operation: "R"
+      soil_ph:
+        protocolPropertyList:
+          RegisterAddress: "3"
+          FunctionCode: "holdingregister"
+          Quantity: 1
+          DataType: "uint16"
+          Operation: "R"
+          Scale: 0.1
+      nitrogen_value_buffer:
+        protocolPropertyList:
+          RegisterAddress: "4"
+          FunctionCode: "holdingregister"
+          Quantity: 1
+          DataType: "uint16"
+          Operation: "RW"
+      phosphorus_value_buffer:
+        protocolPropertyList:
+          RegisterAddress: "5"
+          FunctionCode: "holdingregister"
+          Quantity: 1
+          DataType: "uint16"
+          Operation: "RW"
+      potassium_value_buffer:
+        protocolPropertyList:
+          RegisterAddress: "6"
+          FunctionCode: "holdingregister"
+          Quantity: 1
+          DataType: "uint16"
+          Operation: "RW"
+      salinity:
+        protocolPropertyList:
+          RegisterAddress: "7"
+          FunctionCode: "holdingregister"
+          Quantity: 1
+          DataType: "uint16"
+          Operation: "R"
+      tds:
+        protocolPropertyList:
+          RegisterAddress: "8"
+          FunctionCode: "holdingregister"
+          Quantity: 1
+          DataType: "uint16"
+          Operation: "R"
+      soil_fertility:
+        protocolPropertyList:
+          RegisterAddress: "12"
+          FunctionCode: "holdingregister"
+          Quantity: 1
+          DataType: "uint16"
+          Operation: "R"
+      ec_temperature_coefficient:
+        protocolPropertyList:
+          RegisterAddress: "34"
+          FunctionCode: "holdingregister"
+          Quantity: 1
+          DataType: "uint16"
+          Operation: "RW"
+          Scale: 0.1
+      salinity_coefficient:
+        protocolPropertyList:
+          RegisterAddress: "35"
+          FunctionCode: "holdingregister"
+          Quantity: 1
+          DataType: "uint16"
+          Operation: "RW"
+          Scale: 0.01
+      tds_coefficient:
+        protocolPropertyList:
+          RegisterAddress: "36"
+          FunctionCode: "holdingregister"
+          Quantity: 1
+          DataType: "uint16"
+          Operation: "RW"
+          Scale: 0.01
+      temperature_calibration_value:
+        protocolPropertyList:
+          RegisterAddress: "80"
+          FunctionCode: "holdingregister"
+          Quantity: 1
+          DataType: "int16"
+          Operation: "RW"
+          Scale: 0.1
+      moisture_calibration_value:
+        protocolPropertyList:
+          RegisterAddress: "81"
+          FunctionCode: "holdingregister"
+          Quantity: 1
+          DataType: "uint16"
+          Operation: "RW"
+          Scale: 0.1
+      ec_calibration_value:
+        protocolPropertyList:
+          RegisterAddress: "82"
+          FunctionCode: "holdingregister"
+          Quantity: 1
+          DataType: "int16"
+          Operation: "RW"
+      ph_calibration_value:
+        protocolPropertyList:
+          RegisterAddress: "83"
+          FunctionCode: "holdingregister"
+          Quantity: 1
+          DataType: "int16"
+          Operation: "RW"
+      fertility_coefficient:
+        protocolPropertyList:
+          RegisterAddress: "1253"
+          FunctionCode: "holdingregister"
+          Quantity: 1
+          DataType: "float32"
+          Operation: "RW"
+      fertility_bias_value:
+        protocolPropertyList:
+          RegisterAddress: "1255"
+          FunctionCode: "holdingregister"
+          Quantity: 1
+          DataType: "int16"
+          Operation: "RW"
+      nitrogen_coefficient:
+        protocolPropertyList:
+          RegisterAddress: "1256"
+          FunctionCode: "holdingregister"
+          Quantity: 1
+          DataType: "float32"
+          Operation: "RW"
+      nitrogen_bias_value:
+        protocolPropertyList:
+          RegisterAddress: "1258"
+          FunctionCode: "holdingregister"
+          Quantity: 1
+          DataType: "int16"
+          Operation: "RW"
+      phosphorus_coefficient:
+        protocolPropertyList:
+          RegisterAddress: "1266"
+          FunctionCode: "holdingregister"
+          Quantity: 1
+          DataType: "float32"
+          Operation: "RW"
+      phosphorus_bias_value:
+        protocolPropertyList:
+          RegisterAddress: "1268"
+          FunctionCode: "holdingregister"
+          Quantity: 1
+          DataType: "int16"
+          Operation: "RW"
+      potassium_coefficient:
+        protocolPropertyList:
+          RegisterAddress: "1276"
+          FunctionCode: "holdingregister"
+          Quantity: 1
+          DataType: "float32"
+          Operation: "RW"
+      potassium_bias_value:
+        protocolPropertyList:
+          RegisterAddress: "1278"
+          FunctionCode: "holdingregister"
+          Quantity: 1
+          DataType: "int16"
+          Operation: "RW"
+      device_address:
+        protocolPropertyList:
+          RegisterAddress: "2000"
+          FunctionCode: "holdingregister"
+          Quantity: 1
+          DataType: "uint16"
+          Operation: "RW"
+      device_baud_rate_code:
+        protocolPropertyList:
+          RegisterAddress: "2001"
+          FunctionCode: "holdingregister"
+          Quantity: 1
+          DataType: "uint16"
+          Operation: "RW"
+
+  telemetries: |
+    telemetrySettings:
+    telemetries:
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deviceshifu-soil-sensor
+  namespace: deviceshifu
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: deviceshifu-soil-sensor
+  template:
+    metadata:
+      labels:
+        app: deviceshifu-soil-sensor
+    spec:
+      serviceAccountName: edgedevice-sa
+      containers:
+        - name: deviceshifu
+          image: registry.test.shifu.dev/edgenesis/deviceshifu-http-modbustcp:v0.0.2
+          env:
+            - name: EDGEDEVICE_NAME
+              value: "deviceshifu-soil-sensor"
+            - name: EDGEDEVICE_NAMESPACE
+              value: "devices"
+            - name: MODBUS_SLAVE_ID
+              value: "1"
+            - name: MODBUS_TIMEOUT
+              value: "5"
+            - name: PLC_USE_OFFSET
+              value: "false"
+            - name: HTTP_PORT
+              value: "8080"
+            - name: LOG_LEVEL
+              value: "info"
+          ports:
+            - containerPort: 8080
+              name: http
+          volumeMounts:
+            - name: config
+              mountPath: /etc/edgedevice/config
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: deviceshifu-soil-sensor-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: deviceshifu-soil-sensor
+  namespace: deviceshifu
+spec:
+  selector:
+    app: deviceshifu-soil-sensor
+  ports:
+    - port: 80
+      targetPort: 8080
+      protocol: TCP
+      name: http
+  type: ClusterIP
+---
+apiVersion: shifu.edgenesis.io/v1alpha1
+kind: EdgeDevice
+metadata:
+  name: deviceshifu-soil-sensor
+  namespace: devices
+spec:
+  sku: "deviceshifu-soil-sensor"
+  connection: Ethernet
+  address: "192.168.234.85:10123"
+  protocol: "ModbusTCP"
